@@ -1,0 +1,21 @@
+pretrained_path: /path/to/VoxCPM-0.5B/
+train_manifest: /path/to/train.jsonl
+val_manifest: null
+sample_rate: 16000
+batch_size: 16
+grad_accum_steps: 1  # Gradient accumulation steps, >1 can increase effective batch size without increasing memory
+num_workers: 2
+num_iters: 2000
+log_interval: 10
+valid_interval: 1000
+save_interval: 1000
+learning_rate: 0.00001 
+weight_decay: 0.01
+warmup_steps: 100
+max_steps: 2000
+max_batch_tokens: 8192  # Example: single batch can have at most 16k tokens, with batch_size=4, each sample can have at most 4096 tokens
+save_path: /path/to/checkpoints/finetune_all
+tensorboard: /path/to/logs/finetune_all
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
