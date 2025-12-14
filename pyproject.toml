@@ -1,0 +1,16 @@
+[project]
+name = "voxcpm_sm"
+description = "VoxCPM：Tokenizer-Free TTS for Context-Aware Speech Generation and True-to-Life Voice Cloning，you can use this node,easy infer and easy train"
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["simplejson", "wetext", "sortedcontainers", "torch>=2.5.0", "torchaudio>=2.5.0", "transformers>=4.36.2", "einops", "inflect", "addict", "modelscope>=1.22.0", "datasets>=3,<4", "huggingface-hub", "pydantic", "tqdm", "soundfile", "funasr", "spaces", "argbind", "safetensors"]
+
+[project.urls]
+Repository = "https://github.com/smthemex/ComfyUI_VoxCPM_SM"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = "smthemex"
+DisplayName = "ComfyUI_VoxCPM_SM"
+Icon = ""
+includes = []

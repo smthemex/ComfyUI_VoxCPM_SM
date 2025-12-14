@@ -1,0 +1,6 @@
+{"audio": "examples/example.wav", "text": "This is an example audio transcript for training."}
+{"audio": "/absolute/path/to/audio1.wav", "text": "You can use absolute paths for audio files."}
+{"audio": "relative/path/to/audio2.wav", "text": "Or relative paths from the working directory."}
+{"audio": "data/audio3.wav", "text": "Each line is a JSON object with audio path and text.", "duration": 3.5}
+{"audio": "data/audio4.wav", "text": "Optional: add duration field to skip audio loading during filtering.", "duration": 2.8}
+{"audio": "data/audio5.wav", "text": "Optional: add dataset_id for multi-dataset training.", "dataset_id": 1}

@@ -1,0 +1,157 @@
+{
+  "id": "24945ea2-40d0-4ae8-92a4-d471e8631417",
+  "revision": 0,
+  "last_node_id": 5,
+  "last_link_id": 4,
+  "nodes": [
+    {
+      "id": 2,
+      "type": "VoxCPM_SM_KSampler",
+      "pos": [
+        21783.959635193896,
+        -567.2683039441232
+      ],
+      "size": [
+        419.40501453736215,
+        382.3676097304725
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "VoxCPM_SM_Model",
+          "link": 4
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VoxCPM_SM_KSampler"
+      },
+      "widgets_values": [
+        "两只老虎，两只老虎，跑得快",
+        "",
+        10,
+        6,
+        2,
+        false,
+        true,
+        3,
+        false,
+        true
+      ]
+    },
+    {
+      "id": 4,
+      "type": "SaveAudio",
+      "pos": [
+        22341.11634140663,
+        -343.8629820070538
+      ],
+      "size": [
+        270,
+        112
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "audio/ComfyUI"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "VoxCPM_SM_Model",
+      "pos": [
+        21430.734433419628,
+        -473.98401943755584
+      ],
+      "size": [
+        270,
+        130
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VoxCPM_SM_Model",
+          "type": "VoxCPM_SM_Model",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VoxCPM_SM_Model"
+      },
+      "widgets_values": [
+        "VoxCPM1.5.safetensors",
+        "audiovae.pth",
+        "none",
+        true
+      ]
+    }
+  ],
+  "links": [
+    [
+      3,
+      2,
+      0,
+      4,
+      0,
+      "AUDIO"
+    ],
+    [
+      4,
+      5,
+      0,
+      2,
+      0,
+      "VoxCPM_SM_Model"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1.351305709310559,
+      "offset": [
+        -21246.550459900078,
+        713.2587751631312
+      ]
+    },
+    "workflowRendererVersion": "LG",
+    "frontendVersion": "1.32.9",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
