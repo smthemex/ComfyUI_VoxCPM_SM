@@ -5,8 +5,11 @@ Tokenizer-Free TTS for Context-Aware Speech Generation and True-to-Life Voice Cl
 
 -----
 
-# TIPS
+# Update
+* 支持VoxCPM2模型的推理和训练
+* support VoxCPM2 model training and inference
 
+# Training
 * Lora train jsonl files in ' ./VoxCPM/examples/train_data_example.jsonl ' , edit it ,add audio and audio text ;  
 * Lora训练的train\_data\_example.jsonl文件在' ./VoxCPM/examples/train_data_example.jsonl '里，按格式填写你的本地音频路径和对应的文本即可，有4种格式，刚开始按最简单的来就好；
 * 5-10min train audios ，train 2000 step 
@@ -32,12 +35,16 @@ pip install -r requirements.txt
 # 3.checkpoints 
 
 * 3.1 Vae and model [VoxCPM1.5](https://huggingface.co/openbmb/VoxCPM1.5)  只下载vae和models 模型   
+* 3.2 Vae and model [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)  只下载vae和models 模型  
 
 ```
 ├── ComfyUI/models/diffusion_models
 |     ├── VoxCPM.safetensors   #  rename from  model.safetensors 换个名字
+|     ├── VoxCPM2.safetensors   #  rename from  model.safetensors 换个名字
+
 ├── ComfyUI/models/vae
 |     ├──audiovae.pth
+|     ├──VoxCPM2_audiovae.pth  #  rename 换个名字
 ```
 
 # 4.Example

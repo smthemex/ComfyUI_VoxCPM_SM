@@ -1,0 +1,38 @@
+pretrained_path: /path/to/VoxCPM2/
+train_manifest: /path/to/train.jsonl
+val_manifest: null
+sample_rate: 16000        # AudioVAE encoder input rate; must match audio_vae_config.sample_rate
+out_sample_rate: 48000    # AudioVAE decoder output rate; only used at inference, not during training
+batch_size: 2
+grad_accum_steps: 8  # effective batch size = batch_size × grad_accum_steps = 16
+num_workers: 8
+num_iters: 1000
+log_interval: 10
+valid_interval: 500
+save_interval: 500
+learning_rate: 0.0001
+weight_decay: 0.01
+warmup_steps: 100
+max_steps: 1000
+max_batch_tokens: 8192
+max_grad_norm: 1.0  
+save_path: /path/to/checkpoints/finetune_lora
+tensorboard: /path/to/logs/finetune_lora
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+
+# LoRA configuration
+lora:
+  enable_lm: true
+  enable_dit: true
+  enable_proj: false
+  r: 32
+  alpha: 32
+  dropout: 0.0
+
+# Distribution options (optional)
+# - If distribute=false (default): save pretrained_path as base_model in lora_config.json
+# - If distribute=true: save hf_model_id as base_model (hf_model_id is required)
+# hf_model_id: "openbmb/VoxCPM2"
+# distribute: true
