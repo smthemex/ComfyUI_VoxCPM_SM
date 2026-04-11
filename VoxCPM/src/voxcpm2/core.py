@@ -205,7 +205,7 @@ class VoxCPM:
             Yields audio chunks for each generation step if ``streaming=True``,
             otherwise yields a single array containing the final audio.
         """
-        if not text.strip() or not isinstance(text, str):
+        if not isinstance(text, str) or not text.strip():
             raise ValueError("target text must be a non-empty string")
 
         if prompt_wav_path is not None:
