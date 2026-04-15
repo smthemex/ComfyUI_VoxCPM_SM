@@ -29,10 +29,10 @@ except ImportError:
 
 import json
 
-from ..src.voxcpm2.model import VoxCPMModel, VoxCPM2Model
+from ..src.voxcpm.model import VoxCPMModel, VoxCPM2Model
 
-from ..src.voxcpm2.model.voxcpm import LoRAConfig
-from ..src.voxcpm2.training import (
+from ..src.voxcpm.model.voxcpm import LoRAConfig
+from ..src.voxcpm.training import (
     Accelerator,
     BatchProcessor,
     TrainingTracker,
@@ -148,7 +148,7 @@ def train(
     #   Samples exceeding this length will be dropped
     # ------------------------------------------------------------------ #
     if max_batch_tokens and max_batch_tokens > 0:
-        from ..src.voxcpm2.training.data import compute_sample_lengths
+        from ..src.voxcpm.training.data import compute_sample_lengths
 
         audio_vae_fps = base_model.audio_vae.sample_rate / base_model.audio_vae.hop_length
         est_lengths = compute_sample_lengths(
@@ -826,7 +826,11 @@ def save_checkpoint(
         # LoRA finetune: save only lora_A/lora_B weights
         state_dict = {k: v for k, v in full_state.items() if "lora_" in k}
         if SAFETENSORS_AVAILABLE:
-            save_file(state_dict, folder / "lora_weights.safetensors")
+            metadata = {
+                "lora_config": json.dumps(lora_cfg.model_dump() if hasattr(lora_cfg, "model_dump") else vars(lora_cfg), ensure_ascii=False),
+                "format": "lora",
+            }
+            save_file(state_dict, folder / "lora_weights.safetensors",metadata=metadata)
         else:
             torch.save({"state_dict": state_dict}, folder / "lora_weights.ckpt")
 
