@@ -1,8 +1,8 @@
 {
   "id": "24945ea2-40d0-4ae8-92a4-d471e8631417",
   "revision": 0,
-  "last_node_id": 13,
-  "last_link_id": 11,
+  "last_node_id": 14,
+  "last_link_id": 12,
   "nodes": [
     {
       "id": 10,
@@ -36,61 +36,6 @@
       ]
     },
     {
-      "id": 12,
-      "type": "VoxCPM_SM_LoraTrainerInit",
-      "pos": [
-        22588.513950566834,
-        -567.8943557964527
-      ],
-      "size": [
-        286.4322265625,
-        534
-      ],
-      "flags": {},
-      "order": 0,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "info",
-          "type": "STRING",
-          "links": null
-        },
-        {
-          "name": "config_path",
-          "type": "STRING",
-          "links": [
-            11
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "VoxCPM_SM_LoraTrainerInit"
-      },
-      "widgets_values": [
-        "VoxCPM2.safetensors",
-        "VoxCPM2_audiovae.pth",
-        "v2",
-        "I:/train/train_data_diona.jsonl",
-        16000,
-        1,
-        1,
-        10,
-        1000,
-        0.0001,
-        0.01,
-        100,
-        2000,
-        0,
-        32,
-        16,
-        0,
-        true,
-        true,
-        false
-      ]
-    },
-    {
       "id": 13,
       "type": "Note",
       "pos": [
@@ -102,7 +47,7 @@
         95.08691824102925
       ],
       "flags": {},
-      "order": 1,
+      "order": 0,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -161,21 +106,76 @@
       },
       "widgets_values": [
         "",
-        15000,
+        1000,
         0,
         5000
+      ]
+    },
+    {
+      "id": 12,
+      "type": "VoxCPM_SM_LoraTrainerInit",
+      "pos": [
+        22588.513950566834,
+        -567.8943557964527
+      ],
+      "size": [
+        286.4322265625,
+        534
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 2,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "config_path",
+          "type": "STRING",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VoxCPM_SM_LoraTrainerInit"
+      },
+      "widgets_values": [
+        "VoxCPM1.5.safetensors",
+        "audiovae.pth",
+        "v15",
+        "I:/train/train_data_diona.jsonl",
+        44100,
+        1,
+        1,
+        10,
+        1000,
+        0.0001,
+        0.01,
+        100,
+        2000,
+        0,
+        32,
+        16,
+        0,
+        true,
+        true,
+        false
       ]
     },
     {
       "id": 7,
       "type": "VoxCPM_SM_KSampler",
       "pos": [
-        21562.952538299993,
-        -535.6382276775864
+        21590.8317603459,
+        -536.8773163448315
       ],
       "size": [
         467.72279235099995,
-        456
+        504
       ],
       "flags": {},
       "order": 5,
@@ -198,7 +198,7 @@
           "name": "audio",
           "type": "AUDIO",
           "links": [
-            6
+            12
           ]
         }
       ],
@@ -208,13 +208,15 @@
       "widgets_values": [
         "调制解酒药的方法，也很简单，只要把材料均匀混合在一起， 就可以啦",
         "",
-        "你知道不知道我知道你知道还是不知道到底怎么才是知道怎么知道去做知道的事？",
+        "今天就到这里咯",
         10,
         6,
         2,
         true,
         true,
         3,
+        4,
+        "increment",
         false,
         false,
         false,
@@ -222,38 +224,11 @@
       ]
     },
     {
-      "id": 4,
-      "type": "SaveAudio",
-      "pos": [
-        22080.289645452074,
-        -453.75061736736285
-      ],
-      "size": [
-        270,
-        112
-      ],
-      "flags": {},
-      "order": 7,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "link": 6
-        }
-      ],
-      "outputs": [],
-      "properties": {},
-      "widgets_values": [
-        "audio/ComfyUI"
-      ]
-    },
-    {
       "id": 11,
       "type": "LoadAudio",
       "pos": [
-        20987.166549747613,
-        -247.43336000747516
+        20995.783270425814,
+        -206.42523899903807
       ],
       "size": [
         554.154572082869,
@@ -261,7 +236,7 @@
       ],
       "flags": {},
       "order": 2,
-      "mode": 4,
+      "mode": 0,
       "inputs": [],
       "outputs": [
         {
@@ -285,8 +260,8 @@
       "id": 6,
       "type": "VoxCPM_SM_Model",
       "pos": [
-        21198.362576466676,
-        -587.9080829998876
+        21217.444370362926,
+        -562.011358626895
       ],
       "size": [
         270,
@@ -321,17 +296,36 @@
         false,
         false
       ]
+    },
+    {
+      "id": 14,
+      "type": "PreviewAudio",
+      "pos": [
+        22096.338213711657,
+        -439.0838140528818
+      ],
+      "size": [
+        270,
+        88
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 12
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewAudio"
+      },
+      "widgets_values": []
     }
   ],
   "links": [
-    [
-      6,
-      7,
-      0,
-      4,
-      0,
-      "AUDIO"
-    ],
     [
       7,
       6,
@@ -363,6 +357,14 @@
       9,
       0,
       "STRING"
+    ],
+    [
+      12,
+      7,
+      0,
+      14,
+      0,
+      "AUDIO"
     ]
   ],
   "groups": [
@@ -396,10 +398,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.654068439110035,
+      "scale": 0.7288961033617967,
       "offset": [
-        -20817.769991052195,
-        1085.8337605808663
+        -20761.687153036844,
+        949.4865496675999
       ]
     },
     "workflowRendererVersion": "LG",
