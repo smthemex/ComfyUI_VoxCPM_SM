@@ -4,7 +4,6 @@ import io as io_lib
 import numpy as np
 import torch
 import os
-from .VoxCPM.src.voxcpm2.core import VoxCPM as VoxCPM2
 from .VoxCPM.src.voxcpm.core import VoxCPM
 import folder_paths
 from typing_extensions import override
@@ -13,6 +12,8 @@ import random
 import torchaudio
 import soundfile as sf
 from pathlib import PureWindowsPath
+from safetensors import safe_open
+import json
 MAX_SEED = np.iinfo(np.int32).max
 device = torch.device(
     "cuda:0") if torch.cuda.is_available() else torch.device(
@@ -21,6 +22,30 @@ device = torch.device(
 node_cr_path = os.path.dirname(os.path.abspath(__file__))
 original_torchinductor = os.environ.get("TORCHINDUCTOR_DISABLE_CUDAGRAPHS")
 original_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def load_lora_config(safetensors_path):
+
+    try:
+        with safe_open(safetensors_path, framework="pt") as f:
+            # 获取metadata
+            metadata = f.metadata()
+            if "lora_config" in metadata:
+                lora_info = json.loads(metadata["lora_config"])
+                return  lora_info
+            else:
+                return  None
+    except Exception as e:
+        return None
+
+
 
 class VoxCPM_SM_Model(io.ComfyNode):
     @classmethod
@@ -66,6 +91,14 @@ class VoxCPM_SM_Model(io.ComfyNode):
                 params["lora_weights_path"] = lora_path
                 # 使用用户提供的LoRA配置参数
                 from .VoxCPM.src.voxcpm.model.voxcpm import LoRAConfig
+                if lora_path.endswith(".safetensors") and load_lora_config(lora_path) is not None : # 新增lora的 metadata读取
+                    lora_info = load_lora_config(lora_path)
+                    lora_rank = int(lora_info.get("r", lora_rank))
+                    lora_alpha = int(lora_info.get("alpha", lora_alpha))
+                    lora_dropout = float(lora_info.get("dropout", lora_dropout))
+                    enable_lm = bool(lora_info.get("enable_lm", enable_lm))
+                    enable_dit = bool(lora_info.get("enable_dit", enable_dit))
+                    enable_proj = bool(lora_info.get("enable_proj", enable_proj))           
                 params["lora_config"] = LoRAConfig(
                     r=lora_rank,
                     alpha=lora_alpha,
@@ -77,10 +110,9 @@ class VoxCPM_SM_Model(io.ComfyNode):
                 )
                 print(f"Loading LoRA with config: rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}, "
                       f"enable_lm={enable_lm}, enable_dit={enable_dit}, enable_proj={enable_proj}")
-            if version == "v2":
-                model=VoxCPM2.from_pretrained(os.path.join(node_cr_path, "VoxCPM/VoxCPM2"),**params) 
-            else:
-                model=VoxCPM.from_pretrained(os.path.join(node_cr_path, "VoxCPM/VoxCPM15"),**params)
+            
+            repo=os.path.join(node_cr_path, "VoxCPM/VoxCPM2")  if version == "v2" else os.path.join(node_cr_path, "VoxCPM/VoxCPM15")
+            model=VoxCPM.from_pretrained(repo,**params)
             model.version = version
             if lora_path is not None:
                 model.set_lora_enabled(True)
@@ -147,10 +179,9 @@ class VoxCPM_SM_LoraTrainerInit(io.ComfyNode):
             
             vae_path = folder_paths.get_full_path("vae", vae) if vae != "none" else None
             ckpt_path = folder_paths.get_full_path("diffusion_models", dit) if dit != "none" else None
-            if version == "v2":
-                config_file = os.path.join(node_cr_path, "VoxCPM/conf/voxcpm_v2/voxcpm_finetune_lora_w.yaml")
-            else:
-                config_file = os.path.join(node_cr_path, "VoxCPM/conf/voxcpm_v1.5/voxcpm_finetune_lora_w.yaml")
+            
+            config_file = os.path.join(node_cr_path, "VoxCPM/conf/voxcpm_v2/voxcpm_finetune_lora_w.yaml") if version == "v2"  else os.path.join(node_cr_path, "VoxCPM/conf/voxcpm_v1.5/voxcpm_finetune_lora_w.yaml")
+            
             
             if train_manifest:
                 train_manifest = PureWindowsPath(train_manifest).as_posix()
@@ -289,10 +320,8 @@ class VoxCPM_SM_LoraTrainerLoop(io.ComfyNode):
             yaml_args['save_interval'] = save_interval
             
             # 加载训练函数
-            if version == "v15":
-                from .VoxCPM.scripts.train_voxcpm_finetune_w import train
-            else:
-                from .VoxCPM.scripts.train_voxcpm_finetune_w2 import train 
+            
+            from .VoxCPM.scripts.train_voxcpm_finetune_w2 import train 
 
             # 执行训练
             print(f",Training version is: {version} ,starting Lora training from step {current_step} for {train_steps} steps...")
@@ -336,6 +365,7 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
                 io.Boolean.Input("normalize", default=True),
                 io.Boolean.Input("retry_badcase", default=True),
                 io.Int.Input("retry_badcase_max_times", default=3, min=1, max=100,display_mode=io.NumberDisplay.number),
+                io.Int.Input("seed", default=0, min=0, max=MAX_SEED,display_mode=io.NumberDisplay.number),
                 io.Boolean.Input("controllable_cloning", default=False),
                 io.Boolean.Input("ultimate_clone", default=False),
                 io.Boolean.Input("streaming", default=False),
@@ -347,11 +377,13 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
             ],
         ) 
     @classmethod
-    def execute(cls, model,ref_text,voice_design,text,steps,retry_badcase_ratio_threshold,cfg,normalize,retry_badcase,retry_badcase_max_times,controllable_cloning,ultimate_clone,streaming,save_wav,audio=None ) -> io.NodeOutput: 
+    def execute(cls, model,ref_text,voice_design,text,steps,retry_badcase_ratio_threshold,cfg,normalize,retry_badcase,retry_badcase_max_times,seed,
+                controllable_cloning,ultimate_clone,streaming,save_wav,audio=None ) -> io.NodeOutput: 
         # Temporarily set environment variables to avoid CUDA graph issues
         os.environ["TORCHINDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        audio_file_prefix = ''.join(random.choice("0123456789") for _ in range(6))
+        audio_file_prefix = ''.join(random.choice("0123456789") for _ in range(6))+f'seed_{seed}'
+        set_seed(seed) # 在LLM中设置固定随机，但是因为llm并未开启贪心解码（temperature=0），所有不一定有效，仅方便多次推理抽卡
         try:
             #pre data
             if audio is not None:          
