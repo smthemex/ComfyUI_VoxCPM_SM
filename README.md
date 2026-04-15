@@ -6,6 +6,7 @@ Tokenizer-Free TTS for Context-Aware Speech Generation and True-to-Life Voice Cl
 -----
 
 # Update
+* 清理代码，推理加入随机种，不一定生效，支持lora的metadata加载config
 * 支持VoxCPM2模型的推理和训练
 * support VoxCPM2 model training and inference
 
