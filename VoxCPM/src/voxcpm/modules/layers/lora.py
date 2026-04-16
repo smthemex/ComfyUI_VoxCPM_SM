@@ -38,10 +38,41 @@ class LoRALinear(nn.Module):
         # 使用 buffer 存储 scaling，这样修改值不会触发 torch.compile 重编译
         # persistent=False 表示不保存到 state_dict，避免加载时 missing key
         self.register_buffer("scaling", torch.tensor(self._base_scaling), persistent=False)
-
+        self.got_gguf=False
         # 直接持有 weight 和 bias（从原始 Linear 转移过来）
-        self.weight = base.weight
-        self.bias = base.bias  # 可能是 None
+        weight = base.weight
+        if hasattr(weight, "quant_type"):
+            self.got_gguf=True
+            try:
+                from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
+
+                weight = dequantize_gguf_tensor(weight)
+            except Exception:
+                # 仅在无法导入或解量化失败时回退到原始 tensor
+                weight = weight.as_tensor() if hasattr(weight, "as_tensor") else weight
+        elif hasattr(weight, "as_tensor"):
+            weight = weight.as_tensor()
+
+        # 确保 weight 是浮点类型且可梯度
+        self.weight = nn.Parameter(weight.detach().clone())
+
+        bias = base.bias
+        
+        if bias is not None:
+            if hasattr(bias, "quant_type"):
+                try:
+                    from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
+
+                    bias = dequantize_gguf_tensor(bias)
+                    
+                except Exception:
+                    bias = bias.as_tensor() if hasattr(bias, "as_tensor") else bias
+            elif hasattr(bias, "as_tensor"):
+                bias = bias.as_tensor()
+
+            self.bias = nn.Parameter(bias.detach().clone())
+        else:
+            self.bias = None
 
         # LoRA 参数
         if r > 0:
@@ -55,14 +86,29 @@ class LoRALinear(nn.Module):
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor: # add some code to support gguf lora
         # 基础 Linear 计算
+        # print(self.got_gguf)
+        if self.got_gguf:
+            origin_dtype =torch.bfloat16
+        if self.weight.dtype != x.dtype:
+            x = x.to(self.weight.dtype) # torch.float16 when use gguf
         result = F.linear(x, self.weight, self.bias)
+        # print(result.dtype) #torch.float16
+        if self.got_gguf:
+            if origin_dtype != result.dtype:
+                result = result.to(origin_dtype) 
         if self.r <= 0 or self.lora_A is None:
             return result
         # LoRA: result + dropout(x @ A^T @ B^T) * scaling
+        if x.dtype != self.lora_A.dtype:
+            x = x.to(self.lora_A.dtype)
         lora_out = F.linear(F.linear(x, self.lora_A), self.lora_B)
-        return result + self.dropout(lora_out) * self.scaling
+        y=self.dropout(lora_out) * self.scaling
+        if result.dtype != y.dtype:
+            y = y.to(result.dtype)
+        
+        return result + y
 
     def reset_lora_parameters(self):
         """重置 LoRA 参数到初始状态"""

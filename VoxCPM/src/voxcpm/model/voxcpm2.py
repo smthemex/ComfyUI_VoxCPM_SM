@@ -29,7 +29,7 @@ import librosa
 import numpy as np
 from einops import rearrange
 from pydantic import BaseModel
-
+import gc
 try:
     from safetensors.torch import load_file
 
@@ -46,7 +46,7 @@ from ..modules.locdit import CfmConfig, UnifiedCFM, VoxCPMLocDiTV2
 from ..modules.locenc import VoxCPMLocEnc
 from ..modules.minicpm4 import MiniCPM4Config, MiniCPMModel
 from .utils import get_dtype, mask_multichar_chinese_tokens, next_and_close, resolve_runtime_device
-
+import math
 
 # A simple function to trim audio silence using VAD, not used default
 def _trim_audio_silence_vad(audio: torch.Tensor, sample_rate: int, max_silence_ms: float = 200.0, top_db: float = 35.0) -> torch.Tensor:
@@ -152,6 +152,7 @@ class VoxCPM2Model(nn.Module):
         audio_vae: AudioVAEV2,
         lora_config: LoRAConfig = None,
         device: str | None = None,
+        **kwargs,
     ):
         super().__init__()
         self.config = config
@@ -224,13 +225,22 @@ class VoxCPM2Model(nn.Module):
         self.stop_loss = nn.CrossEntropyLoss(reduction="none")
 
         # Audio VAE
+        use_gguf = kwargs.get("use_gguf", False) 
         self.audio_vae = audio_vae
-        self.chunk_size = audio_vae.chunk_size
-        self._decode_chunk_size = getattr(audio_vae, "decode_chunk_size", audio_vae.chunk_size)
-        self._encode_sample_rate = audio_vae.sample_rate
-        self.sample_rate = getattr(audio_vae, "out_sample_rate", audio_vae.sample_rate)
+        if use_gguf :
+            self.chunk_size=math.prod([2, 5, 8, 8])
+            self.decode_chunk_size = math.prod([8, 6, 5, 2, 2, 2])
+            self._decode_chunk_size = getattr(audio_vae, "decode_chunk_size", self.decode_chunk_size)
+            self._encode_sample_rate = 16000
+            self.sample_rate = 48000
+        else:
+            self.chunk_size = audio_vae.chunk_size
+            self._decode_chunk_size = getattr(audio_vae, "decode_chunk_size", audio_vae.chunk_size)  
+            self._encode_sample_rate = audio_vae.sample_rate
+            self.sample_rate = getattr(audio_vae, "out_sample_rate", audio_vae.sample_rate)
+        
 
-        if self.lora_config is not None:
+        if self.lora_config is not None :
             self._apply_lora()
 
     def _apply_lora(self):
@@ -1005,7 +1015,8 @@ class VoxCPM2Model(nn.Module):
             scale_emb = 1.0
 
         text_embed = self.base_lm.embed_tokens(text) * scale_emb
-        combined_embed = text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed
+       
+        combined_embed = text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed #torch.Size([1, 76, 2048]) torch.Size([1, 76, 2048]) torch.Size([1, 76]) torch.Size([1, 76])
 
         prefix_feat_cond = feat[:, -1, ...]  # b, p, d
         pred_feat_seq = []  # b, t, p, d
@@ -1105,87 +1116,75 @@ class VoxCPM2Model(nn.Module):
         **kwargs,
     ):
         vae_path = kwargs.get("vae_path", None)
-        print(vae_path,path)
-        assert os.path.exists(vae_path), f"VAE weights not found at {vae_path}"
+        #print(vae_path,path)
+        if not (not training and kwargs.get("gguf_path", None) is not None):
+            assert os.path.exists(vae_path), f"VAE weights not found at {vae_path}"
         with open(os.path.join(path, "config.json"), "r", encoding="utf-8") as _cfg_f:
             config = VoxCPMConfig.model_validate_json(_cfg_f.read())
         tokenizer = LlamaTokenizerFast.from_pretrained(path)
         audio_vae_config = getattr(config, "audio_vae_config", None)
         audio_vae = AudioVAEV2(config=audio_vae_config) if audio_vae_config else AudioVAEV2()
-        if vae_path.endswith(".safetensors") :
-            vae_state_dict = load_file(vae_path, device="cpu")["state_dict"]
+
+        if kwargs.get("gguf_path") is not None and not training:
+            device=resolve_runtime_device(device)   
+            model = cls(config, tokenizer, None, None, device=device,use_gguf=True)
+            model_state_dict=load_gguf_checkpoint(kwargs.get("gguf_path"))
+            #match_state_dict(model, model_state_dict,show_num=20)
+            set_gguf2meta_model(model,model_state_dict,torch.bfloat16,"cpu")
+            if lora_config is not None:
+                model.lora_config = lora_config
+                model._apply_lora()
+            if vae_path.endswith(".safetensors") :
+                vae_state_dict = load_file(vae_path, device="cpu")["state_dict"]
+            else:
+                vae_state_dict = torch.load(
+                    vae_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )["state_dict"]
+            x=audio_vae.load_state_dict(vae_state_dict, strict=False)
+            print(x)
+            model.audio_vae = audio_vae.to(torch.float32)
+            return model.to(device).eval().optimize(disable=not optimize)
         else:
-            vae_state_dict = torch.load(
-                vae_path,
-                map_location="cpu",
-                weights_only=True,
-            )["state_dict"]
-        # Try to load AudioVAE from safetensors first, fallback to pytorch
-        # audiovae_safetensors_path = os.path.join(path, "audiovae.safetensors")
-        # audiovae_pth_path = os.path.join(path, "audiovae.pth")
-        # if os.path.exists(audiovae_safetensors_path) and SAFETENSORS_AVAILABLE:
-        #     print(f"Loading AudioVAE from safetensors: {audiovae_safetensors_path}", file=sys.stderr)
-        #     vae_state_dict = load_file(audiovae_safetensors_path, device="cpu")
-        # elif os.path.exists(audiovae_pth_path):
-        #     print(f"Loading AudioVAE from pytorch: {audiovae_pth_path}", file=sys.stderr)
-        #     checkpoint = torch.load(
-        #         audiovae_pth_path,
-        #         map_location="cpu",
-        #         weights_only=True,
-        #     )
-        #     vae_state_dict = checkpoint.get("state_dict", checkpoint)
-        # else:
-        #     raise FileNotFoundError(
-        #         f"AudioVAE checkpoint not found. Expected either {audiovae_safetensors_path} or {audiovae_pth_path}"
-        #     )
-        model = cls(config, tokenizer, audio_vae, lora_config, device=device)
-        if not training:
-            lm_dtype = get_dtype(model.config.dtype)
-            model = model.to(lm_dtype)
-        else:  # training mode
-            for name, param in model.named_parameters():
-                if "audio_vae" in name:  # freeze VAE weights
-                    param.requires_grad = False
-                    continue
-                if lora_config is not None:
-                    if "lora" not in name:  # freeze non-LoRA weights
+            model = cls(config, tokenizer, audio_vae, lora_config, device=device)
+            if not training:
+                lm_dtype = get_dtype(model.config.dtype)
+                model = model.to(lm_dtype)      
+            else:  # training mode
+                for name, param in model.named_parameters():
+                    if "audio_vae" in name:  # freeze VAE weights
                         param.requires_grad = False
-        model.audio_vae = model.audio_vae.to(torch.float32)
-        ckpt_path=kwargs.get("ckpt_path", None) 
-        assert ckpt_path is not None, "Please provide 'ckpt_path' in kwargs for model weights." 
-        if ckpt_path.endswith('.safetensors') :
-            model_state_dict=load_file(ckpt_path) 
-        else:
-            checkpoint=torch.load(ckpt_path, map_location="cpu", weights_only=True)
-            model_state_dict = checkpoint.get("state_dict", checkpoint)
+                        continue
+                    if lora_config is not None:
+                        if "lora" not in name:  # freeze non-LoRA weights
+                            param.requires_grad = False
+            model.audio_vae = model.audio_vae.to(torch.float32)
+            if vae_path.endswith(".safetensors") :
+                vae_state_dict = load_file(vae_path, device="cpu")["state_dict"]
+            else:
+                vae_state_dict = torch.load(
+                    vae_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )["state_dict"]
+            ckpt_path=kwargs.get("ckpt_path", None) 
+            assert ckpt_path is not None, "Please provide 'ckpt_path' in kwargs for model weights." 
+            if ckpt_path.endswith('.safetensors') :
+                model_state_dict=load_file(ckpt_path) 
+            else:
+                checkpoint=torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                model_state_dict = checkpoint.get("state_dict", checkpoint)
+            for kw, val in vae_state_dict.items():
+                model_state_dict[f"audio_vae.{kw}"] = val
 
-        # Try to load from safetensors first, fallback to pytorch_model.bin
-        # safetensors_path = os.path.join(path, "model.safetensors")
-        # pytorch_model_path = os.path.join(path, "pytorch_model.bin")
-
-        # if os.path.exists(safetensors_path) and SAFETENSORS_AVAILABLE:
-        #     print(f"Loading model from safetensors: {safetensors_path}", file=sys.stderr)
-        #     model_state_dict = load_file(safetensors_path)
-        # elif os.path.exists(pytorch_model_path):
-        #     print(f"Loading model from pytorch_model.bin: {pytorch_model_path}", file=sys.stderr)
-        #     checkpoint = torch.load(
-        #         pytorch_model_path,
-        #         map_location="cpu",
-        #         weights_only=True,
-        #     )
-        #     model_state_dict = checkpoint.get("state_dict", checkpoint)
-        # else:
-        #     raise FileNotFoundError(f"Model file not found. Expected either {safetensors_path} or {pytorch_model_path}")
-
-        for kw, val in vae_state_dict.items():
-            model_state_dict[f"audio_vae.{kw}"] = val
-
-        # LoRALinear keeps weight/bias compatible with nn.Linear but adds
-        # lora_A/lora_B, which are absent from base pretrained checkpoints.
-        model.load_state_dict(model_state_dict, strict=False)
-        if training:
-            return model
-        return model.to(model.device).eval().optimize(disable=not optimize)
+            # LoRALinear keeps weight/bias compatible with nn.Linear but adds
+            # lora_A/lora_B, which are absent from base pretrained checkpoints.
+            model.load_state_dict(model_state_dict, strict=False)
+            del model_state_dict, vae_state_dict
+            if training:
+                return model
+            return model.to(model.device).eval().optimize(disable=not optimize)
 
     # ------------------------------------------------------------------ #
     # LoRA Weight Management
@@ -1260,3 +1259,109 @@ class VoxCPM2Model(nn.Module):
     def get_lora_state_dict(self) -> dict:
         """Get all LoRA parameters (lora_A/lora_B)."""
         return {name: param.data.clone() for name, param in self.named_parameters() if "lora_" in name}
+
+
+def match_state_dict(meta_model, sd,show_num=10):
+
+    meta_model_keys = set(meta_model.state_dict().keys())   
+    state_dict_keys = set(sd.keys())
+
+    # 打印匹配的键的数量
+    matching_keys = meta_model_keys.intersection(state_dict_keys)
+    print(f"Matching keys count: {len(matching_keys)}")
+    
+    # 打印不在 meta_model 中但在 state_dict 中的键（多余键）
+    extra_keys = state_dict_keys - meta_model_keys
+    if extra_keys:
+        print(f"Extra keys in state_dict (not in meta_model): {len(extra_keys)}")
+        for key in list(extra_keys)[:show_num]:  # 只显示前10个
+            print(f"  - {key}")
+    
+    # 打印不在 state_dict 中但在 meta_model 中的键（缺失键）
+    missing_keys = meta_model_keys - state_dict_keys
+    if missing_keys:
+        print(f"Missing keys in state_dict (not in state_dict): {len(missing_keys)}")
+        for key in list(missing_keys)[:show_num]:  # 只显示前10个
+            print(f"  - {key}")
+    
+    # 如果需要，也可以打印部分匹配的键
+    print(f"Sample matching keys: {list(matching_keys)[:5]}")
+
+def load_gguf_checkpoint(gguf_checkpoint_path):
+
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    from  diffusers.utils  import is_gguf_available, is_torch_available
+    if is_gguf_available() and is_torch_available():
+        import gguf
+        from gguf import GGUFReader
+        from diffusers.quantizers.gguf.utils import SUPPORTED_GGUF_QUANT_TYPES, GGUFParameter
+    else:
+        logger.error(
+            "Loading a GGUF checkpoint in PyTorch, requires both PyTorch and GGUF>=0.10.0 to be installed. Please see "
+            "https://pytorch.org/ and https://github.com/ggerganov/llama.cpp/tree/master/gguf-py for installation instructions."
+        )
+        raise ImportError("Please install torch and gguf>=0.10.0 to load a GGUF checkpoint in PyTorch.")
+
+    reader = GGUFReader(gguf_checkpoint_path)
+    parsed_parameters = {}
+  
+    for i, tensor in enumerate(reader.tensors):
+        name = tensor.name
+        quant_type = tensor.tensor_type
+
+        
+        is_gguf_quant = quant_type not in [gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16]
+        if is_gguf_quant and quant_type not in SUPPORTED_GGUF_QUANT_TYPES:
+            _supported_quants_str = "\n".join([str(type) for type in SUPPORTED_GGUF_QUANT_TYPES])
+            raise ValueError(
+                (
+                    f"{name} has a quantization type: {str(quant_type)} which is unsupported."
+                    "\n\nCurrently the following quantization types are supported: \n\n"
+                    f"{_supported_quants_str}"
+                    "\n\nTo request support for this quantization type please open an issue here: https://github.com/huggingface/diffusers"
+                )
+            )
+
+        weights = torch.from_numpy(tensor.data) #tensor.data.copy()
+ 
+        parsed_parameters[name] = GGUFParameter(weights, quant_type=quant_type) if is_gguf_quant else weights
+        del tensor,weights
+        if i > 0 and i % 1000 == 0:  # 每1000个tensor执行一次gc
+            logger.info(f"Processed {i}tensors...")
+            gc.collect()
+    del reader
+    gc.collect()
+    return parsed_parameters
+
+def set_gguf2meta_model(meta_model,model_state_dict,dtype,device):
+    from diffusers import GGUFQuantizationConfig
+    from diffusers.quantizers.gguf import GGUFQuantizer
+    g_config = GGUFQuantizationConfig(compute_dtype=dtype or torch.bfloat16)
+    hf_quantizer = GGUFQuantizer(quantization_config=g_config)
+    hf_quantizer.pre_quantized = True
+
+
+    hf_quantizer._process_model_before_weight_loading(
+        meta_model,
+        device_map={"": device} if device else None,
+        state_dict=model_state_dict
+    )
+    from diffusers.models.model_loading_utils import load_model_dict_into_meta
+    x,y=load_model_dict_into_meta(
+        meta_model, 
+        model_state_dict, 
+        hf_quantizer=hf_quantizer,
+        device_map={"": device} if device else None,
+        dtype=dtype
+    )
+    print(x,"offload_index")
+    print(y,"state_dict_index")
+
+    hf_quantizer._process_model_after_weight_loading(meta_model)
+
+    
+    del model_state_dict
+    gc.collect()
+    return meta_model.to(dtype=dtype)
