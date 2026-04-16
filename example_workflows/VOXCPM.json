@@ -1,8 +1,8 @@
 {
   "id": "24945ea2-40d0-4ae8-92a4-d471e8631417",
   "revision": 0,
-  "last_node_id": 14,
-  "last_link_id": 12,
+  "last_node_id": 15,
+  "last_link_id": 13,
   "nodes": [
     {
       "id": 10,
@@ -167,72 +167,15 @@
       ]
     },
     {
-      "id": 7,
-      "type": "VoxCPM_SM_KSampler",
-      "pos": [
-        21590.8317603459,
-        -536.8773163448315
-      ],
-      "size": [
-        467.72279235099995,
-        504
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "VoxCPM_SM_Model",
-          "link": 7
-        },
-        {
-          "name": "audio",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": 10
-        }
-      ],
-      "outputs": [
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "links": [
-            12
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "VoxCPM_SM_KSampler"
-      },
-      "widgets_values": [
-        "调制解酒药的方法，也很简单，只要把材料均匀混合在一起， 就可以啦",
-        "",
-        "今天就到这里咯",
-        10,
-        6,
-        2,
-        true,
-        true,
-        3,
-        4,
-        "increment",
-        false,
-        false,
-        false,
-        true
-      ]
-    },
-    {
       "id": 11,
       "type": "LoadAudio",
       "pos": [
-        20995.783270425814,
-        -206.42523899903807
+        21166.499210536353,
+        -216.8620904843035
       ],
       "size": [
-        554.154572082869,
-        143.98824643913053
+        363.3104675506802,
+        170.08018746164282
       ],
       "flags": {},
       "order": 2,
@@ -254,47 +197,6 @@
         "调制解酒药的方法，也很简单，只要把材料均匀混合在一起，就可以啦。.wav",
         null,
         null
-      ]
-    },
-    {
-      "id": 6,
-      "type": "VoxCPM_SM_Model",
-      "pos": [
-        21217.444370362926,
-        -562.011358626895
-      ],
-      "size": [
-        270,
-        298
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "model",
-          "type": "VoxCPM_SM_Model",
-          "links": [
-            7
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "VoxCPM_SM_Model"
-      },
-      "widgets_values": [
-        "VoxCPM2.safetensors",
-        "VoxCPM2_audiovae.pth",
-        "v2",
-        "finetune_lora_20260408_103609\\step_0015000\\lora_weights.safetensors",
-        32,
-        16,
-        0,
-        true,
-        true,
-        false,
-        false
       ]
     },
     {
@@ -323,17 +225,108 @@
         "Node name for S&R": "PreviewAudio"
       },
       "widgets_values": []
+    },
+    {
+      "id": 7,
+      "type": "VoxCPM_SM_KSampler",
+      "pos": [
+        21590.8317603459,
+        -536.8773163448315
+      ],
+      "size": [
+        467.72279235099995,
+        504
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "VoxCPM_SM_Model",
+          "link": 13
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VoxCPM_SM_KSampler"
+      },
+      "widgets_values": [
+        "调制解酒药的方法，也很简单，只要把材料均匀混合在一起， 就可以啦",
+        "",
+        "模型96.5G，所以看看就好算了",
+        10,
+        6,
+        2,
+        true,
+        true,
+        3,
+        309571173,
+        "randomize",
+        false,
+        false,
+        false,
+        true
+      ]
+    },
+    {
+      "id": 15,
+      "type": "VoxCPM_SM_Model",
+      "pos": [
+        21175.47952672063,
+        -607.9963255173419
+      ],
+      "size": [
+        330.3840979770648,
+        322
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "VoxCPM_SM_Model",
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VoxCPM_SM_Model"
+      },
+      "widgets_values": [
+        "none",
+        "VoxCPM2-merger-llm-Q6_K.gguf",
+        "VoxCPM2_audiovae.pth",
+        "v2",
+        "none",
+        32,
+        16,
+        0,
+        true,
+        true,
+        false,
+        false
+      ]
     }
   ],
   "links": [
-    [
-      7,
-      6,
-      0,
-      7,
-      0,
-      "VoxCPM_SM_Model"
-    ],
     [
       9,
       9,
@@ -365,6 +358,14 @@
       14,
       0,
       "AUDIO"
+    ],
+    [
+      13,
+      15,
+      0,
+      7,
+      0,
+      "VoxCPM_SM_Model"
     ]
   ],
   "groups": [
@@ -398,10 +399,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.7288961033617967,
+      "scale": 0.6057525460464038,
       "offset": [
-        -20761.687153036844,
-        949.4865496675999
+        -20868.714327683927,
+        1118.535362639322
       ]
     },
     "workflowRendererVersion": "LG",

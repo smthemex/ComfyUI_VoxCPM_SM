@@ -20,31 +20,15 @@ device = torch.device(
     "mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
 node_cr_path = os.path.dirname(os.path.abspath(__file__))
+
+
+weigths_gguf_current_path = os.path.join(folder_paths.models_dir, "gguf")
+if not os.path.exists(weigths_gguf_current_path):
+    os.makedirs(weigths_gguf_current_path)
+folder_paths.add_model_folder_path("gguf", weigths_gguf_current_path) #  gguf dir
+
 original_torchinductor = os.environ.get("TORCHINDUCTOR_DISABLE_CUDAGRAPHS")
 original_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-
-
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-def load_lora_config(safetensors_path):
-
-    try:
-        with safe_open(safetensors_path, framework="pt") as f:
-            # 获取metadata
-            metadata = f.metadata()
-            if "lora_config" in metadata:
-                lora_info = json.loads(metadata["lora_config"])
-                return  lora_info
-            else:
-                return  None
-    except Exception as e:
-        return None
-
 
 
 class VoxCPM_SM_Model(io.ComfyNode):
@@ -57,6 +41,7 @@ class VoxCPM_SM_Model(io.ComfyNode):
             category="VoxCPM_SM",
             inputs=[
                 io.Combo.Input("dit",options= ["none"] +folder_paths.get_filename_list("diffusion_models") ),
+                io.Combo.Input("gguf",options= ["none"] + folder_paths.get_filename_list("gguf")),
                 io.Combo.Input("vae",options= ["none"] + folder_paths.get_filename_list("vae")),   
                 io.Combo.Input("version",options= ["v2","v15",]  ),
                 io.Combo.Input("lora",options= ["none"] + folder_paths.get_filename_list("loras") ), 
@@ -66,24 +51,38 @@ class VoxCPM_SM_Model(io.ComfyNode):
                 io.Boolean.Input("enable_lm", default=True),
                 io.Boolean.Input("enable_dit", default=True),
                 io.Boolean.Input("enable_proj", default=False),
-                io.Boolean.Input("denoise", default=True),
+                io.Boolean.Input("denoise", default=False),
             ],
             outputs=[
                 io.Custom("VoxCPM_SM_Model").Output("model"),
                 ],
             )
     @classmethod
-    def execute(cls, dit,vae,version,lora,lora_rank,lora_alpha,lora_dropout,enable_lm,enable_dit,enable_proj,denoise) -> io.NodeOutput:
+    def execute(cls, dit,gguf,vae,version,lora,lora_rank,lora_alpha,lora_dropout,enable_lm,enable_dit,enable_proj,denoise) -> io.NodeOutput:
         # Temporarily set environment variables to avoid CUDA graph issues
         os.environ["TORCHINDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"     
+        def load_lora_config(safetensors_path):
+            try:
+                with safe_open(safetensors_path, framework="pt") as f:
+                    # 获取metadata
+                    metadata = f.metadata()
+                    if "lora_config" in metadata:
+                        lora_info = json.loads(metadata["lora_config"])
+                        return  lora_info
+                    else:
+                        return  None
+            except Exception as e:
+                return None
+
         try:
             vae_path=folder_paths.get_full_path("vae", vae) if vae != "none" else None
             ckpt_path=folder_paths.get_full_path("diffusion_models", dit) if dit != "none" else None
             lora_path=folder_paths.get_full_path("loras", lora) if lora != "none" else None
-            assert ckpt_path is not None and vae_path is not None,"Please select a valid model and vae"
-            zipenhancer_model_id=os.path.join(node_cr_path, "VoxCPM/speech_zipenhancer_ans_multiloss_16k_base")
-            params={"vae_path":vae_path,"ckpt_path":ckpt_path,"load_denoiser":denoise,"optimize":False,"zipenhancer_model_id":zipenhancer_model_id}
+            gguf_path=folder_paths.get_full_path("gguf", gguf) if gguf != "none" else None
+            assert (ckpt_path is not None or gguf_path is not None) and vae_path is not None, "Please select a valid model and vae"
+            zipenhancer_model_id=os.path.join(node_cr_path, "VoxCPM/speech_zipenhancer_ans_multiloss_16k_base")  
+            params={"vae_path":vae_path,"ckpt_path":ckpt_path,"load_denoiser":denoise,"optimize":False,"zipenhancer_model_id":zipenhancer_model_id,"gguf_path": gguf_path}
             
             # 如果提供了lora路径，在初始化模型时传递lora_weights_path参数
             # 这样VoxCPM会自动创建LoRA配置并加载权重
@@ -383,6 +382,12 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
         os.environ["TORCHINDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         audio_file_prefix = ''.join(random.choice("0123456789") for _ in range(6))+f'seed_{seed}'
+        def set_seed(seed=42):
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
         set_seed(seed) # 在LLM中设置固定随机，但是因为llm并未开启贪心解码（temperature=0），所有不一定有效，仅方便多次推理抽卡
         try:
             #pre data
