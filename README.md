@@ -6,6 +6,7 @@ Tokenizer-Free TTS for Context-Aware Speech Generation and True-to-Life Voice Cl
 -----
 
 # Update
+* suuport gguf now ,infer just need 4.8G Vram (Q6)，加入gguf模型支持，Q6需要4.8G左右的显存； 
 * 清理代码，推理加入随机种，不一定生效，支持lora的metadata加载config
 * 支持VoxCPM2模型的推理和训练
 * support VoxCPM2 model training and inference
@@ -36,13 +37,15 @@ pip install -r requirements.txt
 # 3.checkpoints 
 
 * 3.1 Vae and model [VoxCPM1.5](https://huggingface.co/openbmb/VoxCPM1.5)  只下载vae和models 模型   
-* 3.2 Vae and model [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)  只下载vae和models 模型  
+* 3.2 Vae and model [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)  只下载vae和models 模型
+* 3.3 model gguf [smthem](https://huggingface.co/smthem/VoxCPM2-gguf-notcpp/tree/main) or  [夸克云盘](https://pan.quark.cn/s/e668adb635d4)
 
 ```
 ├── ComfyUI/models/diffusion_models
 |     ├── VoxCPM.safetensors   #  rename from  model.safetensors 换个名字
-|     ├── VoxCPM2.safetensors   #  rename from  model.safetensors 换个名字
-
+|     ├── VoxCPM2.safetensors   #  rename from  model.safetensors 换个名字 # 可选gguf
+├── ComfyUI/models/gguf
+|     ├── VoxCPM2-merger-llm-Q6_K-token16.gguf # optional 可选safetensors
 ├── ComfyUI/models/vae
 |     ├──audiovae.pth
 |     ├──VoxCPM2_audiovae.pth  #  rename 换个名字
