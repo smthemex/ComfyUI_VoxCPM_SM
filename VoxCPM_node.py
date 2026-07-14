@@ -382,21 +382,31 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
         os.environ["TORCHINDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         audio_file_prefix = ''.join(random.choice("0123456789") for _ in range(6))+f'seed_{seed}'
-        def set_seed(seed=42):
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-        set_seed(seed) # 在LLM中设置固定随机，但是因为llm并未开启贪心解码（temperature=0），所有不一定有效，仅方便多次推理抽卡
+        # def set_seed(seed=42):
+        #     random.seed(seed)
+        #     np.random.seed(seed)
+        #     torch.manual_seed(seed)
+        #     torch.cuda.manual_seed(seed)
+        #     torch.cuda.manual_seed_all(seed)
+        # set_seed(seed) # 在LLM中设置固定随机，但是因为llm并未开启贪心解码（temperature=0），所有不一定有效，仅方便多次推理抽卡
         try:
             #pre data
-            if audio is not None:          
+            if audio is not None: 
                 audio_file = os.path.join(folder_paths.get_temp_directory(), f"audio_refer_temp{audio_file_prefix}.wav")
-                buff = io_lib.BytesIO() 
-                torchaudio.save(buff, audio["waveform"].squeeze(0), audio["sample_rate"],format="FLAC")
-                with open(audio_file, 'wb') as f:
-                    f.write(buff.getbuffer())
+                try :
+                    import soundfile as sf
+                    audio_np = audio["waveform"].squeeze(0).cpu().numpy()
+                    if audio_np.ndim == 2:
+                        audio_np = audio_np.T  # [C, T] -> [T, C]
+                    elif audio_np.ndim == 1:
+                        pass # 单声道直接保存
+                    sf.write(str(audio_file), audio_np, int(audio["sample_rate"]))
+                except Exception as e:
+                    print(e)
+                    buff = io_lib.BytesIO() 
+                    torchaudio.save(buff, audio["waveform"].squeeze(0), audio["sample_rate"],format="FLAC")
+                    with open(audio_file, 'wb') as f:
+                        f.write(buff.getbuffer())
             else:
                 audio_file=None
                 ref_text=None
@@ -422,6 +432,7 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
                     retry_badcase=retry_badcase,        # enable retrying mode for some bad cases (unstoppable)
                     retry_badcase_max_times=retry_badcase_max_times,  # maximum retrying times
                     retry_badcase_ratio_threshold=retry_badcase_ratio_threshold, # maximum length restriction for bad case detection (simple but effective), it could be adjusted for slow pace speech
+                    seed=seed,
                     # supports same args as above
                 ):
                     chunks.append(chunk)
@@ -429,7 +440,7 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
             else:
                 if controllable_cloning:
                     assert audio_file is not None, "Please input audio"
-                    wav_c = model.generate(text=origin_text,reference_wav_path=audio_file,)
+                    wav_c = model.generate(text=origin_text,reference_wav_path=audio_file,seed=seed)
                     output_clone_path=os.path.join(folder_paths.get_output_directory(), f"VoxCPM_{audio_file_prefix}_clone_{ text[:2]}.wav")
                     sf.write(output_clone_path, wav_c,sample_rate )
 
@@ -438,13 +449,15 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
                     reference_wav_path=output_clone_path,
                     cfg_value=cfg,
                     inference_timesteps=steps,
+                    seed=seed
                      )
                 elif ultimate_clone and version == "v2": # only for VoxCPM2
                     wav = model.generate(
                         text=origin_text,
                         prompt_wav_path=audio_file,
                         prompt_text=ref_text,
-                        reference_wav_path=audio_file, # optional, for better simliarity 
+                        reference_wav_path=audio_file,
+                        seed=seed # optional, for better simliarity 
                     )
                 else:
                     wav = model.generate(
@@ -458,7 +471,8 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
                         retry_badcase=retry_badcase,        # enable retrying mode for some bad cases (unstoppable)
                         retry_badcase_max_times=retry_badcase_max_times,  # maximum retrying times
                         retry_badcase_ratio_threshold=retry_badcase_ratio_threshold, # maximum length restriction for bad case detection (simple but effective), it could be adjusted for slow pace speech
-                            )
+                        seed=seed
+                                )
             if save_wav:
                 sf.write(output_path, wav,sample_rate )
             waveform = torch.from_numpy(wav).unsqueeze(0) #torch.Size([1, 232848])

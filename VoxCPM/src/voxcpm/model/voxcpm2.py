@@ -45,11 +45,13 @@ from ..modules.layers.lora import apply_lora_to_named_linear_modules
 from ..modules.locdit import CfmConfig, UnifiedCFM, VoxCPMLocDiTV2
 from ..modules.locenc import VoxCPMLocEnc
 from ..modules.minicpm4 import MiniCPM4Config, MiniCPMModel
-from .utils import get_dtype, mask_multichar_chinese_tokens, next_and_close, resolve_runtime_device
+from .utils import get_dtype, mask_multichar_chinese_tokens, next_and_close, resolve_runtime_device,apply_generation_seed,materialize_generation_seed
 import math
 
 # A simple function to trim audio silence using VAD, not used default
-def _trim_audio_silence_vad(audio: torch.Tensor, sample_rate: int, max_silence_ms: float = 200.0, top_db: float = 35.0) -> torch.Tensor:
+def _trim_audio_silence_vad(
+        audio: torch.Tensor, sample_rate: int, max_silence_ms: float = 200.0, top_db: float = 35.0
+    ) -> torch.Tensor:
     if audio.numel() == 0:
         return audio
     y = audio.squeeze(0).numpy()
@@ -172,6 +174,7 @@ class VoxCPM2Model(nn.Module):
         self.audio_end_token = 102
         self.ref_audio_start_token = 103
         self.ref_audio_end_token = 104
+        self.last_successful_seed = None
 
         # Residual Acoustic LM
         residual_lm_config = config.lm_config.model_copy(deep=True)
@@ -240,8 +243,7 @@ class VoxCPM2Model(nn.Module):
             self.sample_rate = getattr(audio_vae, "out_sample_rate", audio_vae.sample_rate)
         
 
-        if self.lora_config is not None :
-            self._apply_lora()
+
 
     def _apply_lora(self):
         """注入 LoRA 到 LM / DiT / 投影层"""
@@ -473,6 +475,7 @@ class VoxCPM2Model(nn.Module):
         trim_silence_vad: bool = False,
         streaming: bool = False,
         streaming_prefix_len: int = 4,
+        seed: Optional[int] = None,
     ) -> Generator[torch.Tensor, None, None]:
         if retry_badcase and streaming:
             warnings.warn("Retry on bad cases is not supported in streaming mode, setting retry_badcase=False.")
@@ -630,7 +633,11 @@ class VoxCPM2Model(nn.Module):
         target_text_length = len(self.text_tokenizer(target_text))
 
         retry_badcase_times = 0
+        current_seed = materialize_generation_seed(seed)
+        last_attempt_seed = current_seed
         while retry_badcase_times < retry_badcase_max_times:
+            last_attempt_seed = current_seed
+            apply_generation_seed(last_attempt_seed)
             inference_result = self._inference(
                 text_token,
                 text_mask,
@@ -648,6 +655,7 @@ class VoxCPM2Model(nn.Module):
                     for latent_pred, _, _ctx in inference_result:
                         decode_audio = vae_dec.decode_chunk(latent_pred.to(torch.float32))
                         decode_audio = decode_audio.squeeze(1).cpu()
+                        self.last_successful_seed = last_attempt_seed
                         yield decode_audio
                 break
             else:
@@ -659,6 +667,7 @@ class VoxCPM2Model(nn.Module):
                             file=sys.stderr,
                         )
                         retry_badcase_times += 1
+                        current_seed += 1
                         continue
                     else:
                         break
@@ -666,6 +675,7 @@ class VoxCPM2Model(nn.Module):
                     break
 
         if not streaming:
+            self.last_successful_seed = last_attempt_seed
             decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32))
             decode_patch_len = self.patch_size * self._decode_chunk_size
             if context_len > 0:
@@ -790,6 +800,7 @@ class VoxCPM2Model(nn.Module):
         retry_badcase_ratio_threshold: float = 6.0,
         streaming: bool = False,
         streaming_prefix_len: int = 4,
+        seed: Optional[int] = None,
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]], None, None]:
         """
         Generate audio using pre-built prompt cache.
@@ -917,7 +928,11 @@ class VoxCPM2Model(nn.Module):
         # run inference
         target_text_length = len(self.text_tokenizer(target_text))
         retry_badcase_times = 0
+        current_seed = materialize_generation_seed(seed)
+        last_attempt_seed = current_seed
         while retry_badcase_times < retry_badcase_max_times:
+            last_attempt_seed = current_seed
+            apply_generation_seed(last_attempt_seed)
             inference_result = self._inference(
                 text_token,
                 text_mask,
@@ -935,6 +950,7 @@ class VoxCPM2Model(nn.Module):
                     for latent_pred, pred_audio_feat, _ctx in inference_result:
                         decode_audio = vae_dec.decode_chunk(latent_pred.to(torch.float32))
                         decode_audio = decode_audio.squeeze(1).cpu()
+                        self.last_successful_seed = last_attempt_seed
                         yield (decode_audio, target_text_token, pred_audio_feat)
                 break
             else:
@@ -946,12 +962,14 @@ class VoxCPM2Model(nn.Module):
                             file=sys.stderr,
                         )
                         retry_badcase_times += 1
+                        current_seed += 1
                         continue
                     else:
                         break
                 else:
                     break
         if not streaming:
+            self.last_successful_seed = last_attempt_seed
             decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32))
             decode_patch_len = self.patch_size * self._decode_chunk_size
             if context_len > 0:
@@ -1116,7 +1134,6 @@ class VoxCPM2Model(nn.Module):
         **kwargs,
     ):
         vae_path = kwargs.get("vae_path", None)
-        #print(vae_path,path)
         if not (not training and kwargs.get("gguf_path", None) is not None):
             assert os.path.exists(vae_path), f"VAE weights not found at {vae_path}"
         with open(os.path.join(path, "config.json"), "r", encoding="utf-8") as _cfg_f:
@@ -1127,81 +1144,127 @@ class VoxCPM2Model(nn.Module):
 
         if kwargs.get("gguf_path") is not None and not training:
             device=resolve_runtime_device(device)   
-            model = cls(config, tokenizer, None, None, device=device,use_gguf=True)
+            model = cls(config, tokenizer, None, None, device=device, use_gguf=True)
             model_state_dict=load_gguf_checkpoint(kwargs.get("gguf_path"))
-            #match_state_dict(model, model_state_dict,show_num=20)
-            set_gguf2meta_model(model,model_state_dict,torch.bfloat16,"cpu")
+            set_gguf2meta_model(model, model_state_dict, torch.bfloat16, "cpu")
             if lora_config is not None:
                 model.lora_config = lora_config
                 model._apply_lora()
-            if vae_path.endswith(".safetensors") :
+            if vae_path.endswith(".safetensors"):
                 vae_state_dict = load_file(vae_path, device="cpu")["state_dict"]
             else:
-                vae_state_dict = torch.load(
-                    vae_path,
-                    map_location="cpu",
-                    weights_only=True,
-                )["state_dict"]
-            x=audio_vae.load_state_dict(vae_state_dict, strict=False)
+                vae_state_dict = torch.load(vae_path, map_location="cpu", weights_only=True)["state_dict"]
+            x = audio_vae.load_state_dict(vae_state_dict, strict=False)
             print(x)
             model.audio_vae = audio_vae.to(torch.float32)
             return model.to(device).eval().optimize(disable=not optimize)
-        else:
-            model = cls(config, tokenizer, audio_vae, lora_config, device=device)
-            if not training:
-                lm_dtype = get_dtype(model.config.dtype)
-                model = model.to(lm_dtype)      
-            else:  # training mode
-                for name, param in model.named_parameters():
-                    if "audio_vae" in name:  # freeze VAE weights
-                        param.requires_grad = False
-                        continue
-                    if lora_config is not None:
-                        if "lora" not in name:  # freeze non-LoRA weights
-                            param.requires_grad = False
-            model.audio_vae = model.audio_vae.to(torch.float32)
-            if vae_path.endswith(".safetensors") :
-                vae_state_dict = load_file(vae_path, device="cpu")["state_dict"]
-            else:
-                vae_state_dict = torch.load(
-                    vae_path,
-                    map_location="cpu",
-                    weights_only=True,
-                )["state_dict"]
-            ckpt_path=kwargs.get("ckpt_path", None) 
-            assert ckpt_path is not None, "Please provide 'ckpt_path' in kwargs for model weights." 
-            if ckpt_path.endswith('.safetensors') :
-                model_state_dict=load_file(ckpt_path) 
-            else:
-                checkpoint=torch.load(ckpt_path, map_location="cpu", weights_only=True)
-                model_state_dict = checkpoint.get("state_dict", checkpoint)
-            for kw, val in vae_state_dict.items():
-                model_state_dict[f"audio_vae.{kw}"] = val
 
-            # LoRALinear keeps weight/bias compatible with nn.Linear but adds
-            # lora_A/lora_B, which are absent from base pretrained checkpoints.
-            model.load_state_dict(model_state_dict, strict=False)
-            del model_state_dict, vae_state_dict
-            if training:
-                return model
-            return model.to(model.device).eval().optimize(disable=not optimize)
+        # --- normal (non-gguf) path ---
+        model = cls(config, tokenizer, audio_vae, lora_config, device=device)
+
+        # Load state dicts
+        if vae_path.endswith(".safetensors"):
+            vae_state_dict = load_file(vae_path, device="cpu")["state_dict"]
+        else:
+            vae_state_dict = torch.load(vae_path, map_location="cpu", weights_only=True)["state_dict"]
+        ckpt_path = kwargs.get("ckpt_path", None)
+        assert ckpt_path is not None, "Please provide 'ckpt_path' in kwargs for model weights."
+        if ckpt_path.endswith('.safetensors'):
+            model_state_dict = load_file(ckpt_path)
+        else:
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            model_state_dict = checkpoint.get("state_dict", checkpoint)
+        for kw, val in vae_state_dict.items():
+            model_state_dict[f"audio_vae.{kw}"] = val
+
+        # ========== ConvRot INT8 detection & handling ==========
+        has_convrot = False
+        convrot_bases = set()
+        for k in list(model_state_dict.keys()):
+            if k.endswith(".comfy_quant"):
+                base = k[:-len(".comfy_quant")]
+                try:
+                    conf = json.loads(model_state_dict[k].numpy().tobytes())
+                    if conf.get("format") == "int8_tensorwise" and conf.get("convrot", False):
+                        has_convrot = True
+                        convrot_bases.add(base)
+                except Exception:
+                    pass
+
+        if has_convrot:
+            print(f"[ConvRot] Detected {len(convrot_bases)} convrot-int8 layers, replacing specific Linear modules...", file=sys.stderr)
+            # 删除 comfy_quant 标记（不再需要）
+            for k in list(model_state_dict.keys()):
+                if k.endswith(".comfy_quant"):
+                    base = k[:-len(".comfy_quant")]
+                    if base in convrot_bases:
+                        del model_state_dict[k]
+            # 只替换 convrot 量化层为 ConvRotLinear（必须发生在 .to() 之前）
+            model, replaced_keys = replace_linear_with_convrot(model, convrot_bases)
+            # 修改 state dict key：被量化层的 .weight -> .weight_int8
+            for base in convrot_bases:
+                w_key = f"{base}.weight"
+                if w_key in model_state_dict:
+                    model_state_dict[f"{base}.weight_int8"] = model_state_dict.pop(w_key)
+            print(f"[ConvRot] State dict keys adjusted; loading int8 weights into ConvRotLinear.", file=sys.stderr)
+        else:
+            print("[ConvRot] No convrot-int8 layers detected.", file=sys.stderr)
+
+        # ========== LoRA 注入：必须放在 convrot 替换之后 ==========
+        # 此时 convrot 层已被替换为 ConvRotLinear（不是 nn.Linear），
+        # _apply_lora() 的 apply_lora_to_named_linear_modules 会自然跳过它们，
+        # 只替换真正的 nn.Linear 为 LoRALinear。
+        if lora_config is not None:
+            model._apply_lora()
+            print(f"[LoRA] Applied LoRA to remaining nn.Linear layers (auto-skipped ConvRotLinear).", file=sys.stderr)
+
+        # Convert model to compute dtype *after* convrot replacement (ConvRotLinear._apply protects int8/scale buffers)
+        if not training:
+            lm_dtype = get_dtype(model.config.dtype)
+            model = model.to(lm_dtype)
+        else:
+            for name, param in model.named_parameters():
+                if "audio_vae" in name:
+                    param.requires_grad = False
+                    continue
+                if lora_config is not None and "lora" not in name:
+                    param.requires_grad = False
+        model.audio_vae = model.audio_vae.to(torch.float32)
+
+        # LoRALinear keeps weight/bias compatible with nn.Linear but adds
+        # lora_A/lora_B, which are absent from base pretrained checkpoints.
+        model.load_state_dict(model_state_dict, strict=False)
+        del model_state_dict, vae_state_dict
+        if training:
+            return model
+        return model.to(model.device).eval().optimize(disable=not optimize)
 
     # ------------------------------------------------------------------ #
     # LoRA Weight Management
     # ------------------------------------------------------------------ #
-    def _iter_lora_modules(self):
-        """Iterate over all LoRA modules."""
-        from ..modules.layers.lora import LoRALinear
-
-        for module in self.modules():
-            if isinstance(module, LoRALinear):
-                yield module
+    def _find_module_by_path(self, path: str):
+        """通过点分隔路径查找模块（支持 _orig_mod 前缀）。"""
+        clean = path.replace("._orig_mod.", ".")
+        parts = clean.split('.')
+        m = self
+        for p in parts:
+            if isinstance(m, nn.ModuleList):
+                try:
+                    m = m[int(p)]
+                except (ValueError, IndexError):
+                    return None
+            else:
+                m = getattr(m, p, None)
+            if m is None:
+                return None
+        return m
 
     def load_lora_weights(self, lora_path: str, device: str = None):
         """
-        Load LoRA weights from file, supports calling after torch.compile.
-        Uses named_parameters() to handle compile's _orig_mod wrapper.
+        Load LoRA weights from file.
         Supports both safetensors and pytorch formats.
+        ConvRotLinear layers: loads lora_A/lora_B into buffer via load_lora_buffer()
+        for dequant-time merge. LoRALinear layers: normal param copy.
 
         Args:
             lora_path: Checkpoint path (directory or .safetensors/.ckpt file)
@@ -1214,7 +1277,6 @@ class VoxCPM2Model(nn.Module):
         device = device or self.device
         lora_p = Path(lora_path)
 
-        # Try safetensors first, then fallback to .ckpt
         if lora_p.is_dir():
             safetensors_file = lora_p / "lora_weights.safetensors"
             ckpt_file = lora_p / "lora_weights.ckpt"
@@ -1222,7 +1284,6 @@ class VoxCPM2Model(nn.Module):
             safetensors_file = lora_p if lora_p.suffix == ".safetensors" else None
             ckpt_file = lora_p if lora_p.suffix in [".ckpt", ".pth"] else None
 
-        # Load from safetensors if available
         if safetensors_file and safetensors_file.exists() and SAFETENSORS_AVAILABLE:
             state_dict = load_file(str(safetensors_file), device=device)
         elif ckpt_file and ckpt_file.exists():
@@ -1231,9 +1292,59 @@ class VoxCPM2Model(nn.Module):
         else:
             raise FileNotFoundError(f"LoRA checkpoint not found. Expected either {safetensors_file} or {ckpt_file}")
 
-        # Build param mapping (handle torch.compile's _orig_mod prefix)
+        # 步骤1: 构建 ConvRotLinear 路径映射 {clean_path: module}
+        convrot_paths = {}
+        for mod_name, module in self.named_modules():
+            if isinstance(module, ConvRotLinear):
+                clean = mod_name.replace("._orig_mod.", ".")
+                convrot_paths[clean] = module
+
+        # 步骤2: 只处理 ConvRotLinear 的 LoRA key → load_lora_buffer
+        # key 格式: <convrot_module_path>.lora_A / <convrot_module_path>.lora_B
+        # convrot_paths 中的 key 是干净的模块路径（已去除 _orig_mod 前缀）
+        # LoRA checkpoint 中的 key 也是相同格式，所以用精确匹配即可
+        lora_buffer_count = 0
+        keys_to_remove = set()
+        unmatched_lora_keys = []
+        for key in list(state_dict.keys()):
+            if key.endswith('.lora_A'):
+                base = key[:-len('.lora_A')]
+                b_key = key[:-len('_A')] + '_B'
+                if b_key not in state_dict:
+                    continue
+                lora_A = state_dict[key]
+                lora_B = state_dict[b_key]
+                r = lora_A.shape[0]  # lora_A: [r, in_features]
+
+                # 仅精确匹配：LoRA checkpoint 的路径必须与 ConvRotLinear 的路径完全一致
+                convrot_mod = convrot_paths.get(base)
+                if convrot_mod is not None:
+                    # 验证 LoRA shape 与模块 shape 匹配
+                    if lora_A.shape[1] != convrot_mod.in_features or lora_B.shape[0] != convrot_mod.out_features:
+                        print(f"[ConvRot] SKIP (shape mismatch): {base} lora_A={lora_A.shape[1]} module.in={convrot_mod.in_features} lora_B={lora_B.shape[0]} module.out={convrot_mod.out_features}", file=sys.stderr)
+                        continue
+                    alpha = self.lora_config.alpha if self.lora_config is not None else r
+                    convrot_mod.load_lora_buffer(lora_A, lora_B, alpha, r)
+                    lora_buffer_count += 1
+                    keys_to_remove.add(key)
+                    keys_to_remove.add(b_key)
+                else:
+                    unmatched_lora_keys.append(base)
+
+        # 从 state_dict 中移除已加载到 buffer 的 key
+        for k in keys_to_remove:
+            state_dict.pop(k, None)
+
+        if lora_buffer_count > 0:
+            print(f"[ConvRot] Loaded LoRA buffer for {lora_buffer_count} ConvRotLinear layers.", file=sys.stderr)
+
+        # 步骤3: 加载剩余的非 convrot LoRA weights (LoRALinear)
         model_params = dict(self.named_parameters())
-        key_mapping = {k.replace("._orig_mod.", "."): k for k in model_params if "._orig_mod." in k}
+        key_mapping = {}
+        for k in model_params:
+            clean = k.replace("._orig_mod.", ".")
+            if clean != k:
+                key_mapping[clean] = k
 
         loaded_keys, skipped_keys = [], []
         for key, value in state_dict.items():
@@ -1246,15 +1357,36 @@ class VoxCPM2Model(nn.Module):
 
         return loaded_keys, skipped_keys
 
+    def _iter_lora_modules(self):
+        """Iterate over all LoRALinear modules and ConvRotLinear with active LoRA buffer."""
+        from ..modules.layers.lora import LoRALinear
+        seen = set()
+        for module in self.modules():
+            mid = id(module)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            if isinstance(module, LoRALinear):
+                yield module
+            elif isinstance(module, ConvRotLinear) and module._has_lora_buffer:
+                yield module
+
     def set_lora_enabled(self, enabled: bool):
-        """Enable/disable all LoRA layers."""
+        """Enable/disable all LoRA layers (both LoRALinear and ConvRotLinear)."""
         for module in self._iter_lora_modules():
-            module.set_enabled(enabled)
+            if isinstance(module, ConvRotLinear):
+                module.set_lora_buffer_enabled(enabled)
+            else:
+                module.set_enabled(enabled)
 
     def reset_lora_weights(self):
         """Reset all LoRA weights (A: kaiming, B: zeros), effectively unloading LoRA."""
         for module in self._iter_lora_modules():
-            module.reset_lora_parameters()
+            if hasattr(module, 'reset_lora_parameters'):
+                module.reset_lora_parameters()
+            elif isinstance(module, ConvRotLinear):
+                # ConvRotLinear: just disable the LoRA buffer (data stays, but won't be applied)
+                module.set_lora_buffer_enabled(False)
 
     def get_lora_state_dict(self) -> dict:
         """Get all LoRA parameters (lora_A/lora_B)."""
@@ -1365,3 +1497,177 @@ def set_gguf2meta_model(meta_model,model_state_dict,dtype,device):
     del model_state_dict
     gc.collect()
     return meta_model.to(dtype=dtype)
+
+import torch
+import json
+import torch.nn as nn
+import torch.nn.functional as F
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
+
+class ConvRotLinear(nn.Module):
+    """INT8 + ConvRot 量化的 Linear 层，内置 LoRA 支持。
+
+    权重以 int8 + per-channel scale 存储，forward 时首次调用解量化 + 逆 Hadamard 旋转，
+    然后缓存 bf16 权重复用。如果启用了 LoRA，在缓存权重基础上叠加 LoRA delta。
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # int8 量化权重
+        self.register_buffer('weight_int8', torch.empty((out_features, in_features), dtype=torch.int8))
+        # per-channel scale (out_features, 1)
+        self.register_buffer('weight_scale', torch.empty((out_features, 1), dtype=torch.float32))
+        # 解量化 + 逆旋转后的 bf16 缓存
+        self.register_buffer('weight_cached', torch.empty((out_features, in_features), dtype=torch.bfloat16))
+        self.convrot_groupsize = 256
+        # 标记位：True 表示需要首次解量化
+        self._need_dequant = True
+        # LoRA 临时 buffer 标记
+        self._has_lora_buffer = False
+
+        # LoRA 启用/禁用控制（与 LoRALinear 接口一致）
+        self._lora_enabled = True
+
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+    def _apply(self, fn, recurse=True):
+        """Override _apply to protect int8/scale buffers from dtype conversion."""
+        for key, param in self._parameters.items():
+            if param is not None:
+                self._parameters[key] = fn(param)
+        for key, buf in self._buffers.items():
+            if buf is not None:
+                if key in ('weight_int8', 'weight_scale'):
+                    self._buffers[key] = buf.to(device=fn(buf).device)
+                else:
+                    self._buffers[key] = fn(buf)
+        return self
+
+    def load_lora_buffer(self, lora_A_tensor, lora_B_tensor, alpha, r):
+        """将 LoRA 权重存为临时 buffer，每次 forward 在 original space 合并。
+
+        forward 流程:
+          1. dequant: int8 × scale → rotated f32
+          2. un-rotate: rotated → original
+          3. 合并 LoRA delta (original space)
+          4. F.linear(x, original_with_lora, bias)
+
+        不缓存 merged 结果，确保每次 forward 都正确应用 LoRA。
+        """
+        dev = self.weight_cached.device
+        self.register_buffer('_lora_A_buf', lora_A_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
+        self.register_buffer('_lora_B_buf', lora_B_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
+        self._lora_scaling = alpha / r
+        self._has_lora_buffer = True
+        self._need_dequant = True  # 强制下次 forward 执行 dequant + merge
+
+    @torch.no_grad()
+    def _get_original_weight(self):
+        """解量化 int8 → rotated f32 → 逆旋转 → original space f32。"""
+        weight_f32 = self.weight_int8.float() * self.weight_scale  # [out, in], rotated space
+        gs = self.convrot_groupsize
+        k = weight_f32.shape[1]
+        if k % gs != 0:
+            for candidate in (256, 64, 16):
+                if k % candidate == 0:
+                    gs = candidate
+                    break
+        h = _build_hadamard(gs, device=weight_f32.device, dtype=torch.float32)
+        return _rotate_weight(weight_f32, h, gs)  # original space
+
+    def set_lora_buffer_enabled(self, enabled: bool):
+        """启用/禁用 ConvRotLinear 的 LoRA buffer（与 LoRALinear.set_enabled 接口一致）。"""
+        self._lora_enabled = enabled
+
+    def forward(self, x):
+        # 每次 forward 都从 int8 解量化到 original space
+        w = self._get_original_weight()  # [out, in], float32, original space
+        
+        # 如果有 LoRA 且已启用，在 original space 合并 delta
+        if self._has_lora_buffer and self._lora_enabled:
+            delta = (self._lora_B_buf @ self._lora_A_buf).to(dtype=w.dtype, device=w.device) * self._lora_scaling
+            w = w + delta
+        
+        # 缓存 bf16 给可能的下一次使用
+        self.weight_cached.copy_(w.to(torch.bfloat16))
+        # 输入是 bf16，输出保持 bf16，避免下游层 dtype 不匹配
+        out = F.linear(x, w.to(dtype=x.dtype), self.bias)
+        return out
+
+    def extra_repr(self):
+        return (f'in_features={self.in_features}, out_features={self.out_features}, '
+                f'bias={self.bias is not None}, convrot_gs={self.convrot_groupsize}, '
+                f'int8=True')
+
+
+def _find_module_by_key(model, key):
+    """通过点分隔的 key 在 module 树中查找子模块。"""
+    parts = key.split('.')
+    m = model
+    for p in parts:
+        if isinstance(m, nn.ModuleList):
+            m = m[int(p)]
+        else:
+            m = getattr(m, p, None)
+        if m is None:
+            return None
+    return m
+
+
+def replace_linear_with_convrot(model, convrot_bases=None, clear_lora=True):
+    """替换指定路径上的 nn.Linear 为 ConvRotLinear。
+
+    Args:
+        model: 要替换的模型
+        convrot_bases: 需要替换的层基路径集合（不包含 .weight 后缀）。
+            如果为 None，则替换所有 nn.Linear（旧行为）。
+        clear_lora: 如果 True，在替换后从 model.lora_config 中移除 convrot 路径，
+            以避免 _apply_lora 用 LoRALinear 覆盖 ConvRotLinear。
+    """
+    replaced_keys = set()
+    if convrot_bases is not None:
+        for base_key in convrot_bases:
+            parts = base_key.split('.')
+            parent = model
+            for p in parts[:-1]:
+                if isinstance(parent, nn.ModuleList):
+                    parent = parent[int(p)]
+                else:
+                    parent = getattr(parent, p, None)
+                if parent is None:
+                    break
+            if parent is None:
+                continue
+            child_name = parts[-1]
+            module = getattr(parent, child_name, None)
+            if module is None:
+                continue
+            # 检查是否是 nn.Linear（排除已替换的 ConvRotLinear）
+            if isinstance(module, nn.Linear) and not isinstance(module, ConvRotLinear):
+                new_layer = ConvRotLinear(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None
+                )
+                setattr(parent, child_name, new_layer)
+                replaced_keys.add(base_key)
+    else:
+        for name, module in list(model.named_children()):
+            if isinstance(module, nn.Linear):
+                if isinstance(module, ConvRotLinear):
+                    continue
+                new_layer = ConvRotLinear(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None
+                )
+                setattr(model, name, new_layer)
+            else:
+                replace_linear_with_convrot(module, convrot_bases=None)
+    return model, replaced_keys
+
+
