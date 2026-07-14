@@ -1502,7 +1502,10 @@ import torch
 import json
 import torch.nn as nn
 import torch.nn.functional as F
-from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
+try:
+    from comfy_kitchen.tensor.int8 import _build_hadamard, _rotate_weight
+except ImportError:
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
 
 class ConvRotLinear(nn.Module):
     """INT8 + ConvRot 量化的 Linear 层，内置 LoRA 支持。
