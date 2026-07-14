@@ -644,7 +644,7 @@ def generate_sample_audio(
             )
             with torch.no_grad():
                 with autocast_ctx:
-                    generated = unwrapped_model.generate(target_text=text, inference_timesteps=10, cfg_value=2.0)
+                    generated = unwrapped_model.generate(target_text=text, inference_timesteps=10, cfg_value=2.0, seed=42)
 
             # Restore training setup
             # unwrapped_model.to(torch.float32)

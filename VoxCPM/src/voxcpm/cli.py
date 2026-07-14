@@ -262,6 +262,7 @@ def _run_single(args, parser, *, text: str, output: str, prompt_text: str | None
         normalize=args.normalize,
         denoise=args.denoise
         and (args.prompt_audio is not None or args.reference_audio is not None),
+        seed=args.seed,
     )
 
     sf.write(str(output_path), audio_array, model.tts_model.sample_rate)
@@ -327,6 +328,7 @@ def cmd_batch(args, parser):
                 normalize=args.normalize,
                 denoise=args.denoise
                 and (prompt_audio_path is not None or reference_audio_path is not None),
+                seed=args.seed,
             )
 
             output_file = output_dir / f"output_{i:03d}.wav"
@@ -369,6 +371,12 @@ def _add_common_generation_args(parser):
     parser.add_argument(
         "--normalize", action="store_true", help="Enable text normalization"
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for generation (default: None)",
+    )
 
 
 def _add_prompt_reference_args(parser):
@@ -392,6 +400,12 @@ def _add_prompt_reference_args(parser):
         "--denoise",
         action="store_true",
         help="Enable prompt/reference speech enhancement",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for generation (default: None)",
     )
 
 
@@ -422,6 +436,7 @@ def _add_model_args(parser):
         type=str,
         help="ZipEnhancer model id or local path (or env ZIPENHANCER_MODEL_PATH)",
     )
+    
 
 
 def _add_lora_args(parser):

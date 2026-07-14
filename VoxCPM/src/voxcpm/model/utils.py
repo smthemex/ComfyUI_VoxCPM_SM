@@ -12,6 +12,18 @@ def next_and_close(gen):
     finally:
         gen.close()
 
+def materialize_generation_seed(seed: Optional[int]) -> int:
+    """Return a concrete seed for a generation request."""
+    if seed is not None:
+        return int(seed)
+    return int(torch.seed() & 0xFFFFFFFF)
+
+
+def apply_generation_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 
 def mask_multichar_chinese_tokens(tokenizer: PreTrainedTokenizer):
     """Create a tokenizer wrapper that converts multi-character Chinese tokens to single characters.
