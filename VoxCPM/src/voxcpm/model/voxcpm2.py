@@ -1177,38 +1177,44 @@ class VoxCPM2Model(nn.Module):
         for kw, val in vae_state_dict.items():
             model_state_dict[f"audio_vae.{kw}"] = val
 
-        # ========== ConvRot INT8 detection & handling ==========
-        has_convrot = False
-        convrot_bases = set()
+        # ========== ConvRot INT8 / INT4 detection & handling ==========
+        # convrot_plan: base_path -> format ("int8_tensorwise" | "convrot_w4a4")
+        convrot_plan = {}
         for k in list(model_state_dict.keys()):
             if k.endswith(".comfy_quant"):
                 base = k[:-len(".comfy_quant")]
                 try:
                     conf = json.loads(model_state_dict[k].numpy().tobytes())
-                    if conf.get("format") == "int8_tensorwise" and conf.get("convrot", False):
-                        has_convrot = True
-                        convrot_bases.add(base)
+                    fmt = conf.get("format")
+                    if conf.get("convrot", False) and fmt in ("int8_tensorwise", "convrot_w4a4"):
+                        convrot_plan[base] = fmt
                 except Exception:
                     pass
 
-        if has_convrot:
-            print(f"[ConvRot] Detected {len(convrot_bases)} convrot-int8 layers, replacing specific Linear modules...", file=sys.stderr)
+        if convrot_plan:
+            n8 = sum(1 for f in convrot_plan.values() if f == "int8_tensorwise")
+            n4 = sum(1 for f in convrot_plan.values() if f == "convrot_w4a4")
+            print(f"[ConvRot] Detected {len(convrot_plan)} convrot layers "
+                  f"(int8={n8}, int4={n4}), replacing specific Linear modules...", file=sys.stderr)
             # 删除 comfy_quant 标记（不再需要）
             for k in list(model_state_dict.keys()):
                 if k.endswith(".comfy_quant"):
                     base = k[:-len(".comfy_quant")]
-                    if base in convrot_bases:
+                    if base in convrot_plan:
                         del model_state_dict[k]
-            # 只替换 convrot 量化层为 ConvRotLinear（必须发生在 .to() 之前）
-            model, replaced_keys = replace_linear_with_convrot(model, convrot_bases)
-            # 修改 state dict key：被量化层的 .weight -> .weight_int8
-            for base in convrot_bases:
+            # 按格式替换 convrot 量化层为 ConvRotLinear(int8) / ConvRotInt4Linear(int4)
+            # 必须发生在 .to() 之前
+            model, replaced_keys = replace_linear_with_convrot(model, convrot_plan)
+            # 修改 state dict key：被量化层的 .weight -> 对应 buffer
+            #   int8 -> .weight_int8 ；int4 -> .weight_packed
+            for base, fmt in convrot_plan.items():
                 w_key = f"{base}.weight"
                 if w_key in model_state_dict:
-                    model_state_dict[f"{base}.weight_int8"] = model_state_dict.pop(w_key)
-            print(f"[ConvRot] State dict keys adjusted; loading int8 weights into ConvRotLinear.", file=sys.stderr)
+                    buf_key = "weight_int8" if fmt == "int8_tensorwise" else "weight_packed"
+                    model_state_dict[f"{base}.{buf_key}"] = model_state_dict.pop(w_key)
+            print(f"[ConvRot] State dict keys adjusted; loading convrot weights into layers.", file=sys.stderr)
         else:
-            print("[ConvRot] No convrot-int8 layers detected.", file=sys.stderr)
+            print("[ConvRot] No convrot layers detected.", file=sys.stderr)
 
         # ========== LoRA 注入：必须放在 convrot 替换之后 ==========
         # 此时 convrot 层已被替换为 ConvRotLinear（不是 nn.Linear），
@@ -1295,7 +1301,7 @@ class VoxCPM2Model(nn.Module):
         # 步骤1: 构建 ConvRotLinear 路径映射 {clean_path: module}
         convrot_paths = {}
         for mod_name, module in self.named_modules():
-            if isinstance(module, ConvRotLinear):
+            if isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
                 clean = mod_name.replace("._orig_mod.", ".")
                 convrot_paths[clean] = module
 
@@ -1368,13 +1374,13 @@ class VoxCPM2Model(nn.Module):
             seen.add(mid)
             if isinstance(module, LoRALinear):
                 yield module
-            elif isinstance(module, ConvRotLinear) and module._has_lora_buffer:
+            elif isinstance(module, (ConvRotLinear, ConvRotInt4Linear)) and module._has_lora_buffer:
                 yield module
 
     def set_lora_enabled(self, enabled: bool):
         """Enable/disable all LoRA layers (both LoRALinear and ConvRotLinear)."""
         for module in self._iter_lora_modules():
-            if isinstance(module, ConvRotLinear):
+            if isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
                 module.set_lora_buffer_enabled(enabled)
             else:
                 module.set_enabled(enabled)
@@ -1384,8 +1390,8 @@ class VoxCPM2Model(nn.Module):
         for module in self._iter_lora_modules():
             if hasattr(module, 'reset_lora_parameters'):
                 module.reset_lora_parameters()
-            elif isinstance(module, ConvRotLinear):
-                # ConvRotLinear: just disable the LoRA buffer (data stays, but won't be applied)
+            elif isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
+                # ConvRotLinear / ConvRotInt4Linear: just disable the LoRA buffer (data stays, but won't be applied)
                 module.set_lora_buffer_enabled(False)
 
     def get_lora_state_dict(self) -> dict:
@@ -1507,6 +1513,17 @@ try:
 except ImportError:
     from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
 
+try:
+    from comfy_kitchen.backends.eager.svdquant import _unpack_int4_row_major
+except ImportError:  # pragma: no cover - fallback mirror of the int4 codec
+    def _unpack_int4_row_major(packed):
+        x32 = packed.to(torch.int32)
+        lo = x32 & 0x0F
+        hi = (x32 >> 4) & 0x0F
+        lo = torch.where(lo >= 8, lo - 16, lo)
+        hi = torch.where(hi >= 8, hi - 16, hi)
+        return torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], -1).to(torch.int8)
+
 class ConvRotLinear(nn.Module):
     """INT8 + ConvRot 量化的 Linear 层，内置 LoRA 支持。
 
@@ -1521,8 +1538,6 @@ class ConvRotLinear(nn.Module):
         self.register_buffer('weight_int8', torch.empty((out_features, in_features), dtype=torch.int8))
         # per-channel scale (out_features, 1)
         self.register_buffer('weight_scale', torch.empty((out_features, 1), dtype=torch.float32))
-        # 解量化 + 逆旋转后的 bf16 缓存
-        self.register_buffer('weight_cached', torch.empty((out_features, in_features), dtype=torch.bfloat16))
         self.convrot_groupsize = 256
         # 标记位：True 表示需要首次解量化
         self._need_dequant = True
@@ -1561,7 +1576,7 @@ class ConvRotLinear(nn.Module):
 
         不缓存 merged 结果，确保每次 forward 都正确应用 LoRA。
         """
-        dev = self.weight_cached.device
+        dev = self.weight_int8.device
         self.register_buffer('_lora_A_buf', lora_A_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
         self.register_buffer('_lora_B_buf', lora_B_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
         self._lora_scaling = alpha / r
@@ -1595,8 +1610,6 @@ class ConvRotLinear(nn.Module):
             delta = (self._lora_B_buf @ self._lora_A_buf).to(dtype=w.dtype, device=w.device) * self._lora_scaling
             w = w + delta
         
-        # 缓存 bf16 给可能的下一次使用
-        self.weight_cached.copy_(w.to(torch.bfloat16))
         # 输入是 bf16，输出保持 bf16，避免下游层 dtype 不匹配
         out = F.linear(x, w.to(dtype=x.dtype), self.bias)
         return out
@@ -1605,6 +1618,85 @@ class ConvRotLinear(nn.Module):
         return (f'in_features={self.in_features}, out_features={self.out_features}, '
                 f'bias={self.bias is not None}, convrot_gs={self.convrot_groupsize}, '
                 f'int8=True')
+
+
+class ConvRotInt4Linear(nn.Module):
+    """INT4 + ConvRot 量化的 Linear 层，内置 LoRA 支持（与 ConvRotLinear 接口一致）。
+
+    权重以 int4（packed 到 int8, shape [out, in//2]） + per-channel scale 存储，
+    forward 时解包 int4 -> 反量化 -> 逆 Hadamard 旋转，得到 original space 的 fp 权重，
+    再在 original space 叠加 LoRA delta。
+    参考 comfy-model-tools-main/convrot_loader.ConvRotInt4Linear 实现。
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # int4 量化权重：每字节打包两个 int4 nibble -> int8 [out, in//2]
+        self.register_buffer('weight_packed', torch.empty((out_features, in_features // 2), dtype=torch.int8))
+        # per-channel scale (out_features,) —— 与 convrot_loader 的 int4 格式一致
+        self.register_buffer('weight_scale', torch.empty((out_features,), dtype=torch.float32))
+        self.convrot_groupsize = 256
+        self._need_dequant = True
+        self._has_lora_buffer = False
+        self._lora_enabled = True
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+    def _apply(self, fn, recurse=True):
+        """Override _apply to protect packed/scale buffers from dtype conversion."""
+        for key, param in self._parameters.items():
+            if param is not None:
+                self._parameters[key] = fn(param)
+        for key, buf in self._buffers.items():
+            if buf is not None:
+                if key in ('weight_packed', 'weight_scale'):
+                    self._buffers[key] = buf.to(device=fn(buf).device)
+                else:
+                    self._buffers[key] = fn(buf)
+        return self
+
+    def load_lora_buffer(self, lora_A_tensor, lora_B_tensor, alpha, r):
+        """将 LoRA 权重存为临时 buffer，每次 forward 在 original space 合并（与 ConvRotLinear 一致）。"""
+        dev = self.weight_packed.device
+        self.register_buffer('_lora_A_buf', lora_A_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
+        self.register_buffer('_lora_B_buf', lora_B_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
+        self._lora_scaling = alpha / r
+        self._has_lora_buffer = True
+        self._need_dequant = True
+
+    @torch.no_grad()
+    def _get_original_weight(self):
+        """解包 int4 -> 反量化 -> 逆旋转 -> original space f32。"""
+        qint = _unpack_int4_row_major(self.weight_packed)                 # signed int [out, in]
+        w_rot = qint.float() * self.weight_scale.reshape(-1, 1)           # [out, in], rotated space
+        gs = self.convrot_groupsize
+        k = w_rot.shape[1]
+        if k % gs != 0:
+            for candidate in (256, 64, 16):
+                if k % candidate == 0:
+                    gs = candidate
+                    break
+        h = _build_hadamard(gs, device=w_rot.device, dtype=torch.float32)
+        return _rotate_weight(w_rot, h, gs)                              # -> original space
+
+    def set_lora_buffer_enabled(self, enabled: bool):
+        self._lora_enabled = enabled
+
+    def forward(self, x):
+        w = self._get_original_weight()  # [out, in], float32, original space
+        if self._has_lora_buffer and self._lora_enabled:
+            delta = (self._lora_B_buf @ self._lora_A_buf).to(dtype=w.dtype, device=w.device) * self._lora_scaling
+            w = w + delta
+        out = F.linear(x, w.to(dtype=x.dtype), self.bias)
+        return out
+
+    def extra_repr(self):
+        return (f'in_features={self.in_features}, out_features={self.out_features}, '
+                f'bias={self.bias is not None}, convrot_gs={self.convrot_groupsize}, '
+                f'int4=True')
 
 
 def _find_module_by_key(model, key):
@@ -1621,19 +1713,19 @@ def _find_module_by_key(model, key):
     return m
 
 
-def replace_linear_with_convrot(model, convrot_bases=None, clear_lora=True):
-    """替换指定路径上的 nn.Linear 为 ConvRotLinear。
+def replace_linear_with_convrot(model, convrot_plan=None, clear_lora=True):
+    """替换指定路径上的 nn.Linear 为 ConvRotLinear(int8) / ConvRotInt4Linear(int4)。
 
     Args:
         model: 要替换的模型
-        convrot_bases: 需要替换的层基路径集合（不包含 .weight 后缀）。
-            如果为 None，则替换所有 nn.Linear（旧行为）。
-        clear_lora: 如果 True，在替换后从 model.lora_config 中移除 convrot 路径，
-            以避免 _apply_lora 用 LoRALinear 覆盖 ConvRotLinear。
+        convrot_plan: {base_path: format} 需要替换的层基路径及格式。
+            "int8_tensorwise" -> ConvRotLinear；"convrot_w4a4" -> ConvRotInt4Linear。
+            如果为 None，则替换所有 nn.Linear（旧行为，默认 int8）。
+        clear_lora: 保留参数以兼容旧签名（当前不再需要）。
     """
     replaced_keys = set()
-    if convrot_bases is not None:
-        for base_key in convrot_bases:
+    if convrot_plan is not None:
+        for base_key, fmt in convrot_plan.items():
             parts = base_key.split('.')
             parent = model
             for p in parts[:-1]:
@@ -1649,9 +1741,10 @@ def replace_linear_with_convrot(model, convrot_bases=None, clear_lora=True):
             module = getattr(parent, child_name, None)
             if module is None:
                 continue
-            # 检查是否是 nn.Linear（排除已替换的 ConvRotLinear）
-            if isinstance(module, nn.Linear) and not isinstance(module, ConvRotLinear):
-                new_layer = ConvRotLinear(
+            # 检查是否是 nn.Linear（排除已替换的 convrot 层）
+            if isinstance(module, nn.Linear) and not isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
+                cls = ConvRotInt4Linear if fmt == "convrot_w4a4" else ConvRotLinear
+                new_layer = cls(
                     module.in_features,
                     module.out_features,
                     bias=module.bias is not None
@@ -1661,7 +1754,7 @@ def replace_linear_with_convrot(model, convrot_bases=None, clear_lora=True):
     else:
         for name, module in list(model.named_children()):
             if isinstance(module, nn.Linear):
-                if isinstance(module, ConvRotLinear):
+                if isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
                     continue
                 new_layer = ConvRotLinear(
                     module.in_features,
@@ -1670,7 +1763,7 @@ def replace_linear_with_convrot(model, convrot_bases=None, clear_lora=True):
                 )
                 setattr(model, name, new_layer)
             else:
-                replace_linear_with_convrot(module, convrot_bases=None)
+                replace_linear_with_convrot(module, convrot_plan=None)
     return model, replaced_keys
 
 
