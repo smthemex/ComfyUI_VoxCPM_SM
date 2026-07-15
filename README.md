@@ -6,7 +6,7 @@ Tokenizer-Free TTS for Context-Aware Speech Generation and True-to-Life Voice Cl
 -----
 
 # Update
-* Support convrot-int8 quant model,seed support ,加入convrot-int8量化模型支持，seed应用跟随官方源码
+* Support convrot-int8 /int4 quant model,seed support，int4 only need 2G Vram,加入convrot-int8/int4量化模型支持，seed应用跟随官方源码，int4只需要2G显存
 * Support gguf now ,infer just need 4.8G Vram (Q6)，加入gguf模型支持，Q6需要4.8G左右的显存； 
 * 清理代码，推理加入随机种，不一定生效，支持lora的metadata加载config
 * 支持VoxCPM2模型的推理和训练
@@ -45,7 +45,7 @@ pip install -r requirements.txt
 ├── ComfyUI/models/diffusion_models
 |     ├── VoxCPM.safetensors   #  rename from  model.safetensors 换个名字
 |     ├── VoxCPM2.safetensors   #  rename from  model.safetensors 换个名字 # 可选gguf
-|     ├── VoxCPM2_int8_convrot.safetensors  # 可选int8_convrot 2.4G
+|     ├── VoxCPM2_int8_convrot.safetensors  # 可选int8_convrot 2.4G or int4_convrot 1.3G
 ├── ComfyUI/models/gguf
 |     ├── VoxCPM2-merger-llm-Q6_K-token16.gguf # optional 可选safetensors
 ├── ComfyUI/models/vae
