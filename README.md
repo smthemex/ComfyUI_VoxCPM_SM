@@ -6,6 +6,7 @@ Tokenizer-Free TTS for Context-Aware Speech Generation and True-to-Life Voice Cl
 -----
 
 # Update
+* 新增fp8，w4a8模型支持,修复bug, support  fp8，w4a8 ,fix bug
 * Support convrot-int8 /int4 quant model,seed support，int4 only need 2G Vram,加入convrot-int8/int4量化模型支持，seed应用跟随官方源码，int4只需要2G显存
 * Support gguf now ,infer just need 4.8G Vram (Q6)，加入gguf模型支持，Q6需要4.8G左右的显存； 
 * 清理代码，推理加入随机种，不一定生效，支持lora的metadata加载config
@@ -14,7 +15,7 @@ Tokenizer-Free TTS for Context-Aware Speech Generation and True-to-Life Voice Cl
 
 # Training
 * Lora train jsonl files in ' ./VoxCPM/examples/train_data_example.jsonl ' , edit it ,add audio and audio text ;  
-* Lora训练的train\_data\_example.jsonl文件在' ./VoxCPM/examples/train_data_example.jsonl '里，按格式填写你的本地音频路径和对应的文本即可，有4种格式，刚开始按最简单的来就好；
+* Lora训练的train_data_example.jsonl文件在' ./VoxCPM/examples/train_data_example.jsonl '里，按格式填写你的本地音频路径和对应的文本即可，有4种格式，刚开始按最简单的来就好；
 * 5-10min train audios ，train 2000 step 
 * 官方推荐的是5-10分钟音频数据，训练2000步即可 ，模型自动存在lora目录下； 训练节点只是懒得开webui搓的单线程，性能不是最优， 因为ComfyUI的天然缺陷在那。
 * 训练方法，在init节点填写本地train_data_example.jsonl路径，去掉引号，选择模型和vae，点击运行；
@@ -37,8 +38,8 @@ pip install -r requirements.txt
 
 # 3.checkpoints 
 
-* 3.1 Vae and model [VoxCPM1.5](https://huggingface.co/openbmb/VoxCPM1.5)  只下载vae和models 模型   
-* 3.2 Vae and model [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)  只下载vae和models 模型
+* 3.1 Vae and model [VoxCPM1.5](https://huggingface.co/openbmb/VoxCPM1.5)  只下载vae和models 模型     
+* 3.2 Vae and model [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)  只下载vae和models 模型  
 * 3.3 model gguf or int8_convrot [smthem](https://huggingface.co/smthem/VoxCPM2-gguf-notcpp/tree/main) or  [夸克云盘](https://pan.quark.cn/s/e668adb635d4)
 
 ```
@@ -52,10 +53,13 @@ pip install -r requirements.txt
 |     ├──audiovae.pth
 |     ├──VoxCPM2_audiovae.pth  #  rename 换个名字
 ```
+* 量化模型对比  
+![](https://github.com/smthemex/ComfyUI_VoxCPM_SM/blob/main/example_workflows/model.png)
 
 # 4.Example
 * Infer or train  lora 推理或训练lora  
-![](https://github.com/smthemex/ComfyUI\_VoxCPM\_SM/blob/main/example\_workflows/example.png)
+![](https://github.com/smthemex/ComfyUI_VoxCPM_SM/blob/main/example_workflows/example.png)
+
 
 # 5.Citation
 ```

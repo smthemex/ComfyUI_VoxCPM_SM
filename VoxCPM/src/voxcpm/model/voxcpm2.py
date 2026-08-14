@@ -280,6 +280,19 @@ class VoxCPM2Model(nn.Module):
                 import triton  # noqa: F401
             except ImportError:
                 raise ValueError("triton is not installed")
+            # FP8 / W4A8 量化层包含 float8_e4m3fn 张量，与 torch.compile 的
+            # reduce-overhead（CUDA graph）模式不兼容：图捕获时 fp8 权重的
+            # 反量化 cast 会被静默错误处理，得到全零/垃圾权重 -> 推理声音空白。
+            # 此类模型跳过 CUDA-graph 编译，退回普通前向以保证正确性。
+            has_fp8_like = any(
+                isinstance(m, (ConvRotFp8Linear, ConvRotW4A8Linear))
+                for m in self.modules()
+            )
+            if has_fp8_like:
+                print("[ConvRot] 检测到 FP8/W4A8 量化层，已禁用 CUDA-graph（torch.compile reduce-overhead）"
+                      "编译，以避免 fp8 张量在编译图中被错误处理导致推理空白。退回普通前向（保证正确，速度略降）。",
+                      file=sys.stderr)
+                return self
             self.base_lm.forward_step = torch.compile(self.base_lm.forward_step, mode="reduce-overhead", fullgraph=True)
             self.residual_lm.forward_step = torch.compile(
                 self.residual_lm.forward_step, mode="reduce-overhead", fullgraph=True
@@ -1177,41 +1190,145 @@ class VoxCPM2Model(nn.Module):
         for kw, val in vae_state_dict.items():
             model_state_dict[f"audio_vae.{kw}"] = val
 
-        # ========== ConvRot INT8 / INT4 detection & handling ==========
-        # convrot_plan: base_path -> format ("int8_tensorwise" | "convrot_w4a4")
+        # ========== ConvRot INT8 / INT4 / FP8 / W4A8 detection & handling ==========
+        # convrot_plan: base_path -> format
+        #   "int8_tensorwise"  -> ConvRotLinear（INT8 ConvRot）
+        #   "convrot_w4a4"     -> ConvRotInt4Linear（INT4 ConvRot）
+        #   "scaled_fp8"       -> ConvRotFp8Linear（FP8 scaled，无 ConvRot 旋转）
+        #   "asym_w4a8_int8"   -> ConvRotW4A8Linear（W4A8 ConvRot）
         convrot_plan = {}
+        convrot_meta = {}
         for k in list(model_state_dict.keys()):
             if k.endswith(".comfy_quant"):
                 base = k[:-len(".comfy_quant")]
                 try:
                     conf = json.loads(model_state_dict[k].numpy().tobytes())
                     fmt = conf.get("format")
-                    if conf.get("convrot", False) and fmt in ("int8_tensorwise", "convrot_w4a4"):
+                    # 只要存在 comfy_quant 元数据且格式受支持，即视为量化层。
+                    # 注意：quant_w4a8_convrot.py 导出的元数据只有
+                    # {format, group_size, convrot_groupsize}，不含 "convrot" 字段，
+                    # 因此不能要求 conf.get("convrot") 为真。
+                    if fmt in _CONVROT_CLASS_BY_FMT:
                         convrot_plan[base] = fmt
+                        convrot_meta[base] = conf
                 except Exception:
                     pass
+            elif k.endswith(".scaled_fp8"):
+                # 兼容 ComfyUI 原生 scaled_fp8 布局：scope 级标量 marker（scope + "scaled_fp8"）
+                # 该 marker 存在时，把所有 2D fp8 权重层都视为 scaled_fp8
+                if "__fp8_marker_seen__" not in convrot_meta:
+                    convrot_meta["__fp8_marker_seen__"] = True
+                    scope = k[:-len("scaled_fp8")]  # 可能是空串或某前缀
+                    for wk in list(model_state_dict.keys()):
+                        if (wk.endswith(".weight")
+                                and model_state_dict[wk].dtype == torch.float8_e4m3fn
+                                and wk.startswith(scope)):
+                            base = wk[:-len(".weight")]
+                            if base not in convrot_plan:
+                                convrot_plan[base] = "scaled_fp8"
+                                convrot_meta[base] = {"format": "scaled_fp8", "convrot": True}
+            elif k.endswith(".scale_inverted"):
+                # 本项目专用 fp8_voxcpm 格式：逐层逆 scale（= 1/scale）
+                base = k[:-len(".scale_inverted")]
+                if base not in convrot_plan:
+                    convrot_plan[base] = "fp8_voxcpm"
+                    convrot_meta[base] = {"format": "fp8_voxcpm", "convrot": True}
+            elif k.endswith(".scale_weight"):
+                # 原生 scaled_fp8 格式：逐层正 scale（= 除数 scale）
+                base = k[:-len(".scale_weight")]
+                if base not in convrot_plan:
+                    convrot_plan[base] = "scaled_fp8"
+                    convrot_meta[base] = {"format": "scaled_fp8", "convrot": True}
 
         if convrot_plan:
             n8 = sum(1 for f in convrot_plan.values() if f == "int8_tensorwise")
             n4 = sum(1 for f in convrot_plan.values() if f == "convrot_w4a4")
+            nfp8 = sum(1 for f in convrot_plan.values() if f == "scaled_fp8")
+            nw4a8 = sum(1 for f in convrot_plan.values() if f == "asym_w4a8_int8")
             print(f"[ConvRot] Detected {len(convrot_plan)} convrot layers "
-                  f"(int8={n8}, int4={n4}), replacing specific Linear modules...", file=sys.stderr)
+                  f"(int8={n8}, int4={n4}, fp8={nfp8}, w4a8={nw4a8}), "
+                  f"replacing specific Linear modules...", file=sys.stderr)
             # 删除 comfy_quant 标记（不再需要）
             for k in list(model_state_dict.keys()):
                 if k.endswith(".comfy_quant"):
                     base = k[:-len(".comfy_quant")]
                     if base in convrot_plan:
                         del model_state_dict[k]
-            # 按格式替换 convrot 量化层为 ConvRotLinear(int8) / ConvRotInt4Linear(int4)
+            # 维度预检：checkpoint 量化权重的 in/out 维度必须与模型（config）一致。
+            # 量化不改变维度，若不一致说明该 checkpoint 来自不同规模（不同 hidden_size）的模型。
+            for base, fmt in convrot_plan.items():
+                w_key = f"{base}.weight"
+                if w_key not in model_state_dict:
+                    continue
+                ckpt_w = model_state_dict[w_key]
+                mod = _find_module_by_key(model, base)
+                if mod is None or not hasattr(mod, "out_features"):
+                    continue
+                # convrot 量化权重第一维=out_features；packed 类第二维为 in//2
+                if fmt in ("convrot_w4a4", "asym_w4a8_int8"):
+                    exp_out = mod.out_features
+                    exp_in = mod.in_features // 2
+                else:
+                    exp_out, exp_in = mod.out_features, mod.in_features
+                if ckpt_w.shape[0] != exp_out or ckpt_w.shape[1] != exp_in:
+                    raise RuntimeError(
+                        f"[ConvRot] 维度不匹配：量化层 '{base}' 的 checkpoint 权重形状为 "
+                        f"{tuple(ckpt_w.shape)}，但模型（config）期望 [out={exp_out}, in={exp_in}]。"
+                        f"这通常意味着该量化 checkpoint 来自不同规模（不同 hidden_size）的模型，"
+                        f"请确认加载的 config.json 与导出该量化文件所用的原始模型一致。"
+                    )
+            # 按格式替换 convrot 量化层
             # 必须发生在 .to() 之前
             model, replaced_keys = replace_linear_with_convrot(model, convrot_plan)
+            # 将检测到的格式写入各 ConvRot 模块，供反量化时精确选择 scale
+            for base, fmt in convrot_plan.items():
+                mod = _find_module_by_key(model, base)
+                if mod is not None and isinstance(mod, _CONVROT_LAYER_TYPES):
+                    mod._convrot_format = fmt
+            # 针对 W4A8 层：根据元数据调整 group_size / convrot_groupsize 并 resize s_rel buffer，
+            # 使其与磁盘上的 [out, in//group_size] 形状一致（load_state_dict 才能复制）。
+            for base, fmt in convrot_plan.items():
+                if fmt != "asym_w4a8_int8":
+                    continue
+                mod = _find_module_by_key(model, base)
+                if mod is None or not isinstance(mod, ConvRotW4A8Linear):
+                    continue
+                conf = convrot_meta.get(base, {})
+                gs = int(conf.get("group_size", 16))
+                cgs = int(conf.get("convrot_groupsize", 256))
+                mod.group_size = gs
+                mod.convrot_groupsize = cgs
+                # 重新注册 s_rel buffer 为正确形状（dtype 用 fp32，避免 fp8 下溢归零）
+                dev = mod.weight_s_rel.device
+                mod.register_buffer(
+                    'weight_s_rel',
+                    torch.empty((mod.out_features, mod.in_features // gs),
+                                dtype=torch.float32, device=dev),
+                )
             # 修改 state dict key：被量化层的 .weight -> 对应 buffer
-            #   int8 -> .weight_int8 ；int4 -> .weight_packed
+            #   int8  -> .weight_int8
+            #   int4  -> .weight_packed
+            #   fp8   -> .weight_fp8
+            #   w4a8  -> .weight_packed（int4 打包）+ 各 scale buffer
+            # 其余量化专属 buffer（scale_inverted / s_rel / s_channel / codebook）直接按原 key 保留
             for base, fmt in convrot_plan.items():
                 w_key = f"{base}.weight"
                 if w_key in model_state_dict:
-                    buf_key = "weight_int8" if fmt == "int8_tensorwise" else "weight_packed"
+                    buf_key = {
+                        "int8_tensorwise": "weight_int8",
+                        "convrot_w4a4": "weight_packed",
+                        "scaled_fp8": "weight_fp8",
+                        "asym_w4a8_int8": "weight_packed",
+                    }.get(fmt, "weight_int8")
                     model_state_dict[f"{base}.{buf_key}"] = model_state_dict.pop(w_key)
+            # W4A8 兼容：buffer 统一 fp32（避免 fp8 下溢）。若 checkpoint 的 weight_s_rel
+            # 以 fp8 导出（--scale_dtype fp8），则就地 .float() 转为 fp32 以对齐 buffer dtype。
+            for base, fmt in convrot_plan.items():
+                if fmt != "asym_w4a8_int8":
+                    continue
+                rel_key = f"{base}.weight_s_rel"
+                if rel_key in model_state_dict and model_state_dict[rel_key].dtype != torch.float32:
+                    model_state_dict[rel_key] = model_state_dict[rel_key].to(torch.float32)
             print(f"[ConvRot] State dict keys adjusted; loading convrot weights into layers.", file=sys.stderr)
         else:
             print("[ConvRot] No convrot layers detected.", file=sys.stderr)
@@ -1237,9 +1354,79 @@ class VoxCPM2Model(nn.Module):
                     param.requires_grad = False
         model.audio_vae = model.audio_vae.to(torch.float32)
 
+        # embed_tokens 可能被量化脚本量化（但它是 nn.Embedding，不会被
+        # replace_linear_with_convrot 替换），这里手动反量化成普通 Embedding.weight，
+        # 否则 embed 随机初始化 -> 灾难性错误（推理空白/乱码）。
+        # 支持两种量化风格的 embed：
+        #   - FP8 (scaled_fp8 / fp8_voxcpm)：*.weight_fp8 + *.scale_weight(或 *.scale_inverted)
+        #   - W4A8 (asym_w4a8_int8)：*.weight_packed + *.weight_s_rel + *.weight_s_channel + *.weight_codebook
+        emb_prefix = "base_lm.embed_tokens"
+        emb = model.base_lm.embed_tokens
+        try:
+            if f"{emb_prefix}.weight_fp8" in model_state_dict:
+                # ---- FP8 风格 embed ----
+                wq = model_state_dict.pop(f"{emb_prefix}.weight_fp8").float()
+                sc = model_state_dict.pop(f"{emb_prefix}.scale_weight", None)
+                if sc is None:
+                    sc = model_state_dict.pop(f"{emb_prefix}.scale_inverted", None)
+                if sc is not None:
+                    if sc.ndim == 1:
+                        sc = sc.reshape(-1, 1)
+                    wq = wq * sc
+                emb.weight = nn.Parameter(wq.to(emb.weight.dtype), requires_grad=False)
+                model_state_dict.pop(f"{emb_prefix}.weight", None)
+                print("[ConvRot] embed_tokens 已反量化 fp8 权重为 Embedding.weight。", file=sys.stderr)
+            elif f"{emb_prefix}.weight_packed" in model_state_dict:
+                # ---- W4A8 风格 embed ----
+                packed = model_state_dict.pop(f"{emb_prefix}.weight_packed")
+                s_rel = model_state_dict.pop(f"{emb_prefix}.weight_s_rel").float()
+                s_channel = model_state_dict.pop(f"{emb_prefix}.weight_s_channel").float()
+                codebook = model_state_dict.pop(f"{emb_prefix}.weight_codebook").float()
+                model_state_dict.pop(f"{emb_prefix}.weight", None)
+                # 反量化（与 ConvRotW4A8Linear._get_original_weight 一致）
+                qint = _unpack_uint4_row_major(packed)        # unsigned 0..15 [V, in]
+                V, in_f = qint.shape
+                gs = in_f // s_rel.shape[1]                    # 由 s_rel 形状反推 group_size
+                groups = s_rel.shape[1]
+                group_scale = s_channel.reshape(-1, 1) * s_rel  # [V, groups]
+                decoded = codebook[qint.long()].reshape(V, groups, gs)  # [V, groups, gs]
+                w_rot = (decoded * group_scale.reshape(V, groups, 1)).reshape(V, in_f)
+                # 逆 Hadamard（convrot_groupsize 块，256 优先，回退到能整除的值）
+                cgs = 256
+                if in_f % cgs != 0:
+                    for cand in (64, 16):
+                        if in_f % cand == 0:
+                            cgs = cand
+                            break
+                h = _build_hadamard(cgs, device=w_rot.device, dtype=torch.float32)
+                w = _rotate_weight(w_rot, h, cgs)               # original space
+                emb.weight = nn.Parameter(w.to(emb.weight.dtype), requires_grad=False)
+                print(f"[ConvRot] embed_tokens 已反量化 w4a8 权重为 Embedding.weight "
+                      f"(group_size={gs}, convrot_groupsize={cgs})。", file=sys.stderr)
+        except Exception as _e:
+            print(f"[ConvRot] embed_tokens 反量化失败: {_e}", file=sys.stderr)
+
+        # 顶层 scaled_fp8 marker 是标量标记，无对应模块参数，剔除避免 unexpected 噪音
+        if "scaled_fp8" in model_state_dict:
+            model_state_dict.pop("scaled_fp8")
+
         # LoRALinear keeps weight/bias compatible with nn.Linear but adds
         # lora_A/lora_B, which are absent from base pretrained checkpoints.
-        model.load_state_dict(model_state_dict, strict=False)
+        _load_ret = model.load_state_dict(model_state_dict, strict=False)
+        # 诊断：量化层反量化正常但输出异常时，多半是 non-quant 层权重缺失/多余
+        # （strict=False 会静默丢弃），这里打印以便定位 checkpoint 完整性。
+        try:
+            _miss = list(_load_ret.missing_keys)
+            _unexp = list(_load_ret.unexpected_keys)
+            # print(f"[ConvRot-LOAD-DIAG] convrot_plan={len(convrot_plan)} "
+            #       f"replaced={len(replaced_keys)} "
+            #       f"missing={len(_miss)} unexpected={len(_unexp)}", file=sys.stderr)
+            if _miss:
+                print(f"[ConvRot-LOAD-DIAG] MISSING (first 20): {_miss[:20]}", file=sys.stderr)
+            if _unexp:
+                print(f"[ConvRot-LOAD-DIAG] UNEXPECTED (first 20): {_unexp[:20]}", file=sys.stderr)
+        except Exception as _e:
+            print(f"[ConvRot-LOAD-DIAG] err {_e}", file=sys.stderr)
         del model_state_dict, vae_state_dict
         if training:
             return model
@@ -1298,10 +1485,10 @@ class VoxCPM2Model(nn.Module):
         else:
             raise FileNotFoundError(f"LoRA checkpoint not found. Expected either {safetensors_file} or {ckpt_file}")
 
-        # 步骤1: 构建 ConvRotLinear 路径映射 {clean_path: module}
+        # 步骤1: 构建 ConvRot 量化层路径映射 {clean_path: module}
         convrot_paths = {}
         for mod_name, module in self.named_modules():
-            if isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
+            if isinstance(module, _CONVROT_LAYER_TYPES):
                 clean = mod_name.replace("._orig_mod.", ".")
                 convrot_paths[clean] = module
 
@@ -1374,13 +1561,13 @@ class VoxCPM2Model(nn.Module):
             seen.add(mid)
             if isinstance(module, LoRALinear):
                 yield module
-            elif isinstance(module, (ConvRotLinear, ConvRotInt4Linear)) and module._has_lora_buffer:
+            elif isinstance(module, _CONVROT_LAYER_TYPES) and module._has_lora_buffer:
                 yield module
 
     def set_lora_enabled(self, enabled: bool):
         """Enable/disable all LoRA layers (both LoRALinear and ConvRotLinear)."""
         for module in self._iter_lora_modules():
-            if isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
+            if isinstance(module, _CONVROT_LAYER_TYPES):
                 module.set_lora_buffer_enabled(enabled)
             else:
                 module.set_enabled(enabled)
@@ -1390,8 +1577,8 @@ class VoxCPM2Model(nn.Module):
         for module in self._iter_lora_modules():
             if hasattr(module, 'reset_lora_parameters'):
                 module.reset_lora_parameters()
-            elif isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
-                # ConvRotLinear / ConvRotInt4Linear: just disable the LoRA buffer (data stays, but won't be applied)
+            elif isinstance(module, _CONVROT_LAYER_TYPES):
+                # ConvRot*Linear: just disable the LoRA buffer (data stays, but won't be applied)
                 module.set_lora_buffer_enabled(False)
 
     def get_lora_state_dict(self) -> dict:
@@ -1523,6 +1710,18 @@ except ImportError:  # pragma: no cover - fallback mirror of the int4 codec
         lo = torch.where(lo >= 8, lo - 16, lo)
         hi = torch.where(hi >= 8, hi - 16, hi)
         return torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], -1).to(torch.int8)
+
+
+def _unpack_uint4_row_major(packed):
+    """Unsigned int4 (0..15) 解包，用于 W4A8 的 codebook 索引（索引必须 0..15，不能用符号位）。
+
+    必须定义在 try/except 之外，否则当 comfy_kitchen 可正常 import 时（不进入 except），
+    _unpack_uint4_row_major 不会被定义，运行时会 NameError。
+    """
+    x32 = packed.to(torch.int32)
+    lo = x32 & 0x0F
+    hi = (x32 >> 4) & 0x0F
+    return torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], -1).to(torch.int32)
 
 class ConvRotLinear(nn.Module):
     """INT8 + ConvRot 量化的 Linear 层，内置 LoRA 支持。
@@ -1687,6 +1886,16 @@ class ConvRotInt4Linear(nn.Module):
 
     def forward(self, x):
         w = self._get_original_weight()  # [out, in], float32, original space
+        if not getattr(self, "_fwd_diag_done", False):
+            self._fwd_diag_done = True
+            try:
+                wn = w.float()
+                # print(f"[ConvRot-FWD-DIAG] FP8 fmt={self._convrot_format} "
+                #       f"w.mean={float(wn.mean()):.6f} w.absmax={float(wn.abs().max()):.4f} "
+                #       f"w.nan={int(wn.isnan().sum())} w.numel={int(wn.numel())}",
+                #       file=sys.stderr)
+            except Exception as _e:
+                print(f"[ConvRot-FWD-DIAG] FP8 err {_e}", file=sys.stderr)
         if self._has_lora_buffer and self._lora_enabled:
             delta = (self._lora_B_buf @ self._lora_A_buf).to(dtype=w.dtype, device=w.device) * self._lora_scaling
             w = w + delta
@@ -1697,6 +1906,254 @@ class ConvRotInt4Linear(nn.Module):
         return (f'in_features={self.in_features}, out_features={self.out_features}, '
                 f'bias={self.bias is not None}, convrot_gs={self.convrot_groupsize}, '
                 f'int4=True')
+
+
+class ConvRotFp8Linear(nn.Module):
+    """FP8 (scaled_fp8) 量化的 Linear 层，内置 LoRA 支持（与 ConvRotLinear 接口一致）。
+
+    权重以 fp8_e4m3fn 存储 + per-tensor/per-channel scale (fp32) 反量化，
+    forward 时解量化到 original space 的 fp 权重，再叠加 LoRA delta。
+    磁盘格式与 comfy-model-tools-main/quant_fp8_scaled.py 完全一致：
+      - {prefix}weight        : fp8_e4m3fn [out, in]
+      - {prefix}scale_inverted : fp32 scalar（= 1/scale）
+    参考 comfy-model-tools-main/fp8_scaled_loader.Fp8ScaledLinear 实现。
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # fp8 量化权重 [out, in]
+        self.register_buffer('weight_fp8', torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn))
+        # 逆 scale（fp32 [out, 1]）：本项目专用 quant_fp8_voxcpm 产出（= 1/scale，per-channel）。
+        # 注意：必须注册为 [out,1] 而非标量！checkpoint 的 *.scale_inverted 是 per-channel [N,1]
+        # 张量，若 buffer 是标量会导致 load_state_dict(strict=False) 因形状不匹配静默丢弃，
+        # 反量化时使用空标量 -> 每通道共用错误 scale -> 权重全错 -> 推理空白/错误声音。
+        self.register_buffer('scale_inverted', torch.empty((out_features, 1), dtype=torch.float32))
+        # per-channel scale（fp32 [out, 1]）：ComfyUI 原生 scaled_fp8 格式
+        #   （load_state_dict 要求形状严格匹配，故注册为 [out_features, 1]）
+        self.register_buffer('scale_weight', torch.empty((out_features, 1), dtype=torch.float32))
+        # 记录实际磁盘格式，反量化时据此精确选择 scale，避免歧义：
+        #   "scaled_fp8" 原生格式 -> 用 scale_weight（= 除数 scale，w = q*scale）
+        #   "fp8_voxcpm" 本项目格式 -> 用 scale_inverted（= 1/scale，w = q*(1/scale)）
+        self._convrot_format = "scaled_fp8"
+        self._has_lora_buffer = False
+        self._lora_enabled = True
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+    def _apply(self, fn, recurse=True):
+        """Override _apply to protect fp8/scale buffers from dtype conversion."""
+        for key, param in self._parameters.items():
+            if param is not None:
+                self._parameters[key] = fn(param)
+        for key, buf in self._buffers.items():
+            if buf is not None:
+                if key in ('weight_fp8', 'scale_inverted', 'scale_weight'):
+                    self._buffers[key] = buf.to(device=fn(buf).device)
+                else:
+                    self._buffers[key] = fn(buf)
+        return self
+
+    def load_lora_buffer(self, lora_A_tensor, lora_B_tensor, alpha, r):
+        """将 LoRA 权重存为临时 buffer，forward 时在 original space 合并（与 ConvRotLinear 一致）。"""
+        dev = self.weight_fp8.device
+        self.register_buffer('_lora_A_buf', lora_A_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
+        self.register_buffer('_lora_B_buf', lora_B_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
+        self._lora_scaling = alpha / r
+        self._has_lora_buffer = True
+
+    @torch.no_grad()
+    def _get_original_weight(self):
+        """fp8 -> f32 original space（scaled_fp8 无 Hadamard 旋转，直接乘 scale）。
+
+        反量化语义严格对应导出脚本 quant_fp8_scaled.py：
+            q = w / scale   (scale = amax(dim=1) / FP8_MAX, per-channel)
+            w = q * scale
+        即 scale_weight 存储的是「除数」scale，反量化等于 q * scale_weight。
+        """
+        w = self.weight_fp8.float()  # [out, in], f32, q
+        if not getattr(self, "_diag_done", False):
+            self._diag_done = True
+            # try:
+            #     print(f"[ConvRot-DIAG] FP8 fmt={self._convrot_format} "
+            #           f"w_fp8.abs().sum={float(w.abs().sum()):.4f} "
+            #           f"scale_inverted={float(self.scale_inverted.abs().sum()):.6f} "
+            #           f"scale_weight.abs().sum={float(self.scale_weight.abs().sum()):.6f}",
+            #           file=sys.stderr)
+            # except Exception as _e:
+            #     print(f"[ConvRot-DIAG] err {_e}", file=sys.stderr)
+        if self._convrot_format == "fp8_voxcpm":
+            # 本项目专用格式：scale_inverted = 1/scale，反量化 = q * (1/scale)
+            if float(self.scale_inverted.abs().sum()) == 0.0:
+                raise RuntimeError(
+                    "[ConvRot] FP8 层反量化失败：scale_inverted 为全 0，说明该键未从 checkpoint 加载。"
+                    "请确认 checkpoint 是本项目专用 fp8_voxcpm 格式（含逐层 .scale_inverted）。"
+                )
+            w = w * self.scale_inverted
+        else:
+            # 原生 scaled_fp8 格式：scale_weight = scale（除数），反量化 = q * scale
+            if float(self.scale_weight.abs().sum()) == 0.0:
+                raise RuntimeError(
+                    "[ConvRot] FP8 层反量化失败：scale_weight 为全 0，说明该键未从 checkpoint 加载。"
+                    "常见原因：导出时使用了 --scale-mode none（不保存 scale），或 checkpoint 缺少 .scale_weight 键。"
+                    "请用 quant_fp8_scaled.py 默认 --scale-mode per-channel 重新导出。"
+                )
+            if self.scale_weight.ndim == 1:
+                w = w * self.scale_weight.reshape(-1, 1)
+            else:
+                w = w * self.scale_weight
+        return w
+
+    def set_lora_buffer_enabled(self, enabled: bool):
+        self._lora_enabled = enabled
+
+    def forward(self, x):
+        w = self._get_original_weight()  # [out, in], float32, original space
+        if not getattr(self, "_fwd_diag_done", False):
+            self._fwd_diag_done = True
+            try:
+                wn = w.float()
+                # print(f"[ConvRot-FWD-DIAG] FP8 fmt={self._convrot_format} "
+                #       f"w.mean={float(wn.mean()):.6f} w.absmax={float(wn.abs().max()):.4f} "
+                #       f"w.nan={int(wn.isnan().sum())} w.numel={int(wn.numel())}",
+                #       file=sys.stderr)
+            except Exception as _e:
+                print(f"[ConvRot-FWD-DIAG] FP8 err {_e}", file=sys.stderr)
+        if self._has_lora_buffer and self._lora_enabled:
+            delta = (self._lora_B_buf @ self._lora_A_buf).to(dtype=w.dtype, device=w.device) * self._lora_scaling
+            w = w + delta
+        out = F.linear(x, w.to(dtype=x.dtype), self.bias)
+        return out
+
+    def extra_repr(self):
+        return (f'in_features={self.in_features}, out_features={self.out_features}, '
+                f'bias={self.bias is not None}, fp8=e4m3fn')
+
+
+class ConvRotW4A8Linear(nn.Module):
+    """W4A8 (asym_w4a8_int8) 量化的 Linear 层，内置 LoRA 支持（与 ConvRotLinear 接口一致）。
+
+    权重以 int4（packed 到 int8） + per-group s_rel(fp8_e4m3fn/ fp32 [out, in//group_size])
+    + per-channel s_channel(fp32 [out]) + codebook(fp32 [16]) 存储，激活侧由下游
+    int8 动态量化完成（本层只负责权重反量化）。
+    forward 时解包 int4 -> 反量化 -> 逆 Hadamard 旋转，得到 original space 的 fp 权重，
+    再叠加 LoRA delta。
+    磁盘格式与 comfy-model-tools-main/quant_w4a8_convrot.py 完全一致：
+      - {prefix}weight          : int8 packed [out, in//2]（row-major，低 nibble=偶数列）
+      - {prefix}weight_s_rel    : fp8/fp32 per-group scale [out, in//group_size]
+      - {prefix}weight_s_channel: fp32 per-channel scale [out]
+      - {prefix}weight_codebook : fp32 [16] Lloyd-Max levels
+      - {prefix}comfy_quant     : {"format":"asym_w4a8_int8","group_size":G,"convrot_groupsize":C}
+    反量化数学（与 comfy_kitchen / quant_w4a8_convrot 一致）：
+      group_scale = s_channel[:,None] * s_rel        # [out, groups]
+      w_rot = codebook[qint].reshape(out, groups, gs) * group_scale[:,:,None]   # [out, in]
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # int4 量化权重：每字节打包两个 int4 nibble -> int8 [out, in//2]（row-major）
+        self.register_buffer('weight_packed', torch.empty((out_features, in_features // 2), dtype=torch.int8))
+        # per-group relative scale。comfy-model-tools 默认 --scale_dtype fp32 导出为
+        # float32；若用户用 --scale_dtype fp8 导出则为 fp8_e4m3fn。
+        # 注意：务必用 fp32 注册！quant_w4a8_convrot.py 默认导出 s_rel 是 fp32，
+        # 且 per-group s_rel = group_scale/s_channel 可能远小于 1，若以 fp8_e4m3fn 存储
+        # 会下溢成 0 -> 整组权重反量化归零 -> 推理输出被压扁成空白。
+        # 因此 buffer 统一 fp32；加载时若 checkpoint 为 fp8 则就地 .float() 转 fp32。
+        self.register_buffer('weight_s_rel', torch.empty((out_features, in_features // 16), dtype=torch.float32))
+        # per-channel scale (fp32 [out])
+        self.register_buffer('weight_s_channel', torch.empty((out_features,), dtype=torch.float32))
+        # codebook (fp32 [16])
+        self.register_buffer('weight_codebook', torch.empty((16,), dtype=torch.float32))
+        self.group_size = 16          # 与 comfy_quant 的 group_size 对应（反量化 reshape 用）
+        self.convrot_groupsize = 256  # Hadamard 旋转块大小（与 comfy_quant 的 convrot_groupsize 对应）
+        self._has_lora_buffer = False
+        self._lora_enabled = True
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+    def _apply(self, fn, recurse=True):
+        """Override _apply to protect packed/scale buffers from dtype conversion."""
+        for key, param in self._parameters.items():
+            if param is not None:
+                self._parameters[key] = fn(param)
+        for key, buf in self._buffers.items():
+            if buf is not None:
+                if key in ('weight_packed', 'weight_s_rel', 'weight_s_channel', 'weight_codebook'):
+                    self._buffers[key] = buf.to(device=fn(buf).device)
+                else:
+                    self._buffers[key] = fn(buf)
+        return self
+
+    def load_lora_buffer(self, lora_A_tensor, lora_B_tensor, alpha, r):
+        """将 LoRA 权重存为临时 buffer，forward 时在 original space 合并（与 ConvRotLinear 一致）。"""
+        dev = self.weight_packed.device
+        self.register_buffer('_lora_A_buf', lora_A_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
+        self.register_buffer('_lora_B_buf', lora_B_tensor.contiguous().to(device=dev, dtype=torch.bfloat16))
+        self._lora_scaling = alpha / r
+        self._has_lora_buffer = True
+
+    @torch.no_grad()
+    def _get_original_weight(self):
+        """解包 int4 -> 反量化 -> 逆旋转 -> original space f32。"""
+        if not getattr(self, "_diag_done", False):
+            self._diag_done = True
+            try:
+                print(f"[ConvRot-DIAG] W4A8 packed.abs().sum={float(self.weight_packed.float().abs().sum()):.4f} "
+                      f"s_channel.abs().sum={float(self.weight_s_channel.abs().sum()):.6f} "
+                      f"s_rel.abs().sum={float(self.weight_s_rel.float().abs().sum()):.6f} "
+                      f"codebook.abs().sum={float(self.weight_codebook.abs().sum()):.6f}",
+                      file=sys.stderr)
+            except Exception as _e:
+                print(f"[ConvRot-DIAG] W4A8 err {_e}", file=sys.stderr)
+        qint = _unpack_uint4_row_major(self.weight_packed)                    # unsigned int 0..15 [out, in]
+        out, k = qint.shape
+        gs = self.group_size
+        groups = k // gs
+        # 反量化：group_scale = s_channel[:,None] * s_rel   -> [out, groups]
+        group_scale = self.weight_s_channel.reshape(-1, 1) * self.weight_s_rel.float()  # [out, groups]
+        # codebook 索引（qint 必须 0..15，故用 unsigned 解包）+ 重组为 [out, groups, gs]
+        decoded = self.weight_codebook[qint.long()].reshape(out, groups, gs)   # [out, groups, gs]
+        w_rot = (decoded * group_scale.reshape(out, groups, 1)).reshape(out, k)  # [out, in], rotated space
+        # Hadamard 逆旋转（convrot_groupsize 块）
+        cgs = self.convrot_groupsize
+        if k % cgs != 0:
+            for candidate in (256, 64, 16):
+                if k % candidate == 0:
+                    cgs = candidate
+                    break
+        h = _build_hadamard(cgs, device=w_rot.device, dtype=torch.float32)
+        return _rotate_weight(w_rot, h, cgs)                                  # -> original space
+
+    def set_lora_buffer_enabled(self, enabled: bool):
+        self._lora_enabled = enabled
+
+    def forward(self, x):
+        w = self._get_original_weight()  # [out, in], float32, original space
+        if not getattr(self, "_fwd_diag_done", False):
+            self._fwd_diag_done = True
+            try:
+                wn = w.float()
+                # print(f"[ConvRot-FWD-DIAG] W4A8 "
+                #       f"w.mean={float(wn.mean()):.6f} w.absmax={float(wn.abs().max()):.4f} "
+                #       f"w.nan={int(wn.isnan().sum())} w.numel={int(wn.numel())}",
+                #       file=sys.stderr)
+            except Exception as _e:
+                print(f"[ConvRot-FWD-DIAG] W4A8 err {_e}", file=sys.stderr)
+        if self._has_lora_buffer and self._lora_enabled:
+            delta = (self._lora_B_buf @ self._lora_A_buf).to(dtype=w.dtype, device=w.device) * self._lora_scaling
+            w = w + delta
+        out = F.linear(x, w.to(dtype=x.dtype), self.bias)
+        return out
+
+    def extra_repr(self):
+        return (f'in_features={self.in_features}, out_features={self.out_features}, '
+                f'bias={self.bias is not None}, group_size={self.group_size}, '
+                f'convrot_gs={self.convrot_groupsize}, w4a8=True')
 
 
 def _find_module_by_key(model, key):
@@ -1713,13 +2170,27 @@ def _find_module_by_key(model, key):
     return m
 
 
+_CONVROT_CLASS_BY_FMT = {
+    "int8_tensorwise": ConvRotLinear,
+    "convrot_w4a4": ConvRotInt4Linear,
+    "scaled_fp8": ConvRotFp8Linear,
+    "fp8_voxcpm": ConvRotFp8Linear,
+    "asym_w4a8_int8": ConvRotW4A8Linear,
+}
+
+_CONVROT_LAYER_TYPES = (ConvRotLinear, ConvRotInt4Linear, ConvRotFp8Linear, ConvRotW4A8Linear)
+
+
 def replace_linear_with_convrot(model, convrot_plan=None, clear_lora=True):
-    """替换指定路径上的 nn.Linear 为 ConvRotLinear(int8) / ConvRotInt4Linear(int4)。
+    """替换指定路径上的 nn.Linear 为量化 Linear 层。
 
     Args:
         model: 要替换的模型
         convrot_plan: {base_path: format} 需要替换的层基路径及格式。
-            "int8_tensorwise" -> ConvRotLinear；"convrot_w4a4" -> ConvRotInt4Linear。
+            "int8_tensorwise"     -> ConvRotLinear（INT8 ConvRot）
+            "convrot_w4a4"        -> ConvRotInt4Linear（INT4 ConvRot）
+            "scaled_fp8"          -> ConvRotFp8Linear（FP8 scaled）
+            "asym_w4a8_int8"      -> ConvRotW4A8Linear（W4A8 ConvRot）
             如果为 None，则替换所有 nn.Linear（旧行为，默认 int8）。
         clear_lora: 保留参数以兼容旧签名（当前不再需要）。
     """
@@ -1742,8 +2213,8 @@ def replace_linear_with_convrot(model, convrot_plan=None, clear_lora=True):
             if module is None:
                 continue
             # 检查是否是 nn.Linear（排除已替换的 convrot 层）
-            if isinstance(module, nn.Linear) and not isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
-                cls = ConvRotInt4Linear if fmt == "convrot_w4a4" else ConvRotLinear
+            if isinstance(module, nn.Linear) and not isinstance(module, _CONVROT_LAYER_TYPES):
+                cls = _CONVROT_CLASS_BY_FMT.get(fmt, ConvRotLinear)
                 new_layer = cls(
                     module.in_features,
                     module.out_features,
@@ -1754,7 +2225,7 @@ def replace_linear_with_convrot(model, convrot_plan=None, clear_lora=True):
     else:
         for name, module in list(model.named_children()):
             if isinstance(module, nn.Linear):
-                if isinstance(module, (ConvRotLinear, ConvRotInt4Linear)):
+                if isinstance(module, _CONVROT_LAYER_TYPES):
                     continue
                 new_layer = ConvRotLinear(
                     module.in_features,

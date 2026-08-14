@@ -394,7 +394,7 @@ class VoxCPM_SM_KSampler(io.ComfyNode):
             if audio is not None: 
                 audio_file = os.path.join(folder_paths.get_temp_directory(), f"audio_refer_temp{audio_file_prefix}.wav")
                 try :
-                    import soundfile as sf
+                    
                     audio_np = audio["waveform"].squeeze(0).cpu().numpy()
                     if audio_np.ndim == 2:
                         audio_np = audio_np.T  # [C, T] -> [T, C]
